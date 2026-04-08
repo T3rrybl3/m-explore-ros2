@@ -36,19 +36,23 @@
  *
  *********************************************************************/
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <string>
+#include <tuple>
 #include <thread>
+#include <vector>
 
 #include <map_merge/map_merge.h>
 #include <map_merge/ros1_names.hpp>
 #include <rcpputils/asserts.hpp>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 namespace
 {
-/**
- * Parameters init_pose_[xyz] are documented as robot positions in the world (meters). The merge
- * pipeline warps occupancy images in cell/pixel units; convert translation accordingly.
- */
 geometry_msgs::msg::Transform scaleTranslationMetersToCells(
   const geometry_msgs::msg::Transform& t, double resolution)
 {
@@ -61,6 +65,21 @@ geometry_msgs::msg::Transform scaleTranslationMetersToCells(
   s.translation.z /= resolution;
   return s;
 }
+
+/** World (x,y) of occupancy cell center using only map.info (same math as a transform from map frame at cell center). */
+void mapCellCenterToWorldXY(const nav_msgs::msg::OccupancyGrid& map, double ix, double iy, double& wx,
+                            double& wy)
+{
+  tf2::Quaternion q;
+  tf2::fromMsg(map.info.origin.orientation, q);
+  tf2::Matrix3x3 R(q);
+  const double r = static_cast<double>(map.info.resolution);
+  tf2::Vector3 delta((ix + 0.5) * r, (iy + 0.5) * r, 0.0);
+  tf2::Vector3 t(map.info.origin.position.x, map.info.origin.position.y, map.info.origin.position.z);
+  tf2::Vector3 p = t + R * delta;
+  wx = p.x();
+  wy = p.y();
+}
 }  // namespace
 
 namespace map_merge
@@ -68,8 +87,11 @@ namespace map_merge
 MapMerge::MapMerge() : Node("map_merge", rclcpp::NodeOptions()
                                        .allow_undeclared_parameters(true)
                                        .automatically_declare_parameters_from_overrides(true)),
-subscriptions_size_(0),
-logger_(this->get_logger())
+                       expand_slam_maps_to_common_canvas_(true),
+                       expand_slam_maps_margin_m_(1.0),
+                       expand_slam_maps_apply_init_pose_(false),
+                       subscriptions_size_(0),
+                       logger_(this->get_logger())
 {
   std::string frame_id;
   std::string merged_map_topic;
@@ -84,6 +106,15 @@ logger_(this->get_logger())
   if (!this->has_parameter("robot_namespace")) this->declare_parameter<std::string>("robot_namespace", "");
   if (!this->has_parameter("merged_map_topic")) this->declare_parameter<std::string>("merged_map_topic", "map");
   if (!this->has_parameter("world_frame")) this->declare_parameter<std::string>("world_frame", "world");
+  if (!this->has_parameter("expand_slam_maps_to_common_canvas")) {
+    this->declare_parameter<bool>("expand_slam_maps_to_common_canvas", true);
+  }
+  if (!this->has_parameter("expand_slam_maps_margin_m")) {
+    this->declare_parameter<double>("expand_slam_maps_margin_m", 1.0);
+  }
+  if (!this->has_parameter("expand_slam_maps_apply_init_pose")) {
+    this->declare_parameter<bool>("expand_slam_maps_apply_init_pose", false);
+  }
 
   this->get_parameter("merging_rate", merging_rate_);
   this->get_parameter("discovery_rate", discovery_rate_);
@@ -95,7 +126,9 @@ logger_(this->get_logger())
   this->get_parameter("robot_namespace", robot_namespace_);
   this->get_parameter("merged_map_topic", merged_map_topic);
   this->get_parameter("world_frame", world_frame_);
-
+  this->get_parameter("expand_slam_maps_to_common_canvas", expand_slam_maps_to_common_canvas_);
+  this->get_parameter("expand_slam_maps_margin_m", expand_slam_maps_margin_m_);
+  this->get_parameter("expand_slam_maps_apply_init_pose", expand_slam_maps_apply_init_pose_);
 
   /* publishing */
   // Create a publisher using the QoS settings to emulate a ROS1 latched topic
@@ -189,6 +222,7 @@ void MapMerge::topicSubscribing()
       // no locking here. robots_ are used only in this procedure
       MapSubscription& subscription = subscriptions_.front();
       robots_.insert({robot_name, &subscription});
+      subscription.robot_name = robot_name;
       subscription.initial_pose = init_pose;
 
       /* subscribe callbacks */
@@ -199,8 +233,8 @@ void MapMerge::topicSubscribing()
       auto map_qos = rclcpp::QoS(rclcpp::KeepLast(50)).transient_local().reliable();
       subscription.map_sub = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
           map_topic, map_qos,
-          [this, &subscription](const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
-            fullMapUpdate(msg, subscription);
+          [this, &subscription, robot_name](const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+            fullMapUpdate(msg, subscription, robot_name);
           });
       RCLCPP_INFO(logger_, "Subscribing to MAP updates topic: %s.",
               map_updates_topic.c_str());
@@ -223,15 +257,40 @@ void MapMerge::mapMerging()
   RCLCPP_DEBUG(logger_, "Map merging started.");
   RCLCPP_INFO_ONCE(logger_, "Map merging started.");
 
+  nav_msgs::msg::OccupancyGrid::SharedPtr merged_map;
+
   if (have_initial_poses_) {
+    /* Sort by robot name so reference order is stable (e.g. robot1 first; matches init_pose convention). */
+    std::vector<std::tuple<std::string, nav_msgs::msg::OccupancyGrid::ConstSharedPtr,
+                            geometry_msgs::msg::Transform>>
+      keyed;
+    keyed.reserve(subscriptions_size_);
+    for (auto& subscription : subscriptions_) {
+      keyed.emplace_back(subscription.robot_name, subscription.readonly_map, subscription.initial_pose);
+    }
+    std::sort(keyed.begin(), keyed.end(),
+              [](const auto& a, const auto& b) { return std::get<0>(a) < std::get<0>(b); });
 
     std::vector<nav_msgs::msg::OccupancyGrid::ConstSharedPtr> grids;
     std::vector<geometry_msgs::msg::Transform> transforms;
-    grids.reserve(subscriptions_size_);
-    transforms.reserve(subscriptions_size_);
-    for (auto& subscription : subscriptions_) {
-      grids.push_back(subscription.readonly_map);
-      transforms.push_back(subscription.initial_pose);
+    grids.reserve(keyed.size());
+    transforms.reserve(keyed.size());
+    for (const auto& e : keyed) {
+      grids.push_back(std::get<1>(e));
+      transforms.push_back(std::get<2>(e));
+    }
+
+    bool did_expand = false;
+    if (expand_slam_maps_to_common_canvas_) {
+      std::vector<nav_msgs::msg::OccupancyGrid::ConstSharedPtr> expanded;
+      if (expandSlamMapsToCommonCanvas(grids, expanded) && expanded.size() == grids.size()) {
+        grids = std::move(expanded);
+        did_expand = true;
+        RCLCPP_INFO_ONCE(
+          logger_,
+          "SLAM map expansion: embedded all robot maps in one common grid (map.info only; see issue #10 / "
+          "gingineer map_expansion).");
+      }
     }
 
     double resolution = 0.0;
@@ -243,22 +302,46 @@ void MapMerge::mapMerging()
     }
     std::vector<geometry_msgs::msg::Transform> transforms_cells;
     transforms_cells.reserve(transforms.size());
-    for (const auto& t : transforms) {
-      transforms_cells.push_back(scaleTranslationMetersToCells(t, resolution));
+    /* Without expansion: init_pose only. With expansion: identity unless expand_slam_maps_apply_init_pose
+     * (use measured offsets in the field without disabling expansion). */
+    const bool use_init_pose_in_compose =
+      !did_expand || expand_slam_maps_apply_init_pose_;
+    if (use_init_pose_in_compose) {
+      for (const auto& t : transforms) {
+        transforms_cells.push_back(scaleTranslationMetersToCells(t, resolution));
+      }
+      if (did_expand) {
+        RCLCPP_INFO_ONCE(
+          logger_,
+          "After SLAM map expansion: applying init_pose_* in OpenCV merge "
+          "(expand_slam_maps_apply_init_pose: true).");
+      }
+    } else {
+      geometry_msgs::msg::Transform id;
+      id.translation.x = id.translation.y = id.translation.z = 0.0;
+      id.rotation.w = 1.0;
+      id.rotation.x = id.rotation.y = id.rotation.z = 0.0;
+      for (size_t i = 0; i < transforms.size(); ++i) {
+        transforms_cells.push_back(id);
+      }
+      RCLCPP_INFO_ONCE(
+        logger_,
+        "After SLAM map expansion: identity OpenCV merge (init_pose ignored). Set "
+        "expand_slam_maps_apply_init_pose: true to apply measured init_pose_* (e.g. real robots).");
     }
 
     pipeline_.feed(grids.begin(), grids.end());
     pipeline_.setTransforms(transforms_cells.begin(), transforms_cells.end());
-  }
-
-  // nav_msgs::OccupancyGridPtr merged_map;
-  nav_msgs::msg::OccupancyGrid::SharedPtr merged_map;
-  {
+    {
+      std::lock_guard<std::mutex> lock(pipeline_mutex_);
+      merged_map = pipeline_.composeGrids(logger_);
+    }
+  } else {
     std::lock_guard<std::mutex> lock(pipeline_mutex_);
     merged_map = pipeline_.composeGrids(logger_);
   }
+
   if (!merged_map) {
-    // RCLCPP_INFO(logger_, "No map merged");
     return;
   }
 
@@ -271,6 +354,115 @@ void MapMerge::mapMerging()
 
   rcpputils::assert_true(merged_map->info.resolution > 0.f);
   merged_map_publisher_->publish(*merged_map);
+}
+
+bool MapMerge::expandSlamMapsToCommonCanvas(const std::vector<nav_msgs::msg::OccupancyGrid::ConstSharedPtr>& in,
+                                            std::vector<nav_msgs::msg::OccupancyGrid::ConstSharedPtr>& out)
+{
+  out.clear();
+  std::vector<const nav_msgs::msg::OccupancyGrid*> valid;
+  for (const auto& g : in) {
+    if (g && !g->data.empty() && g->info.resolution > 0.f) {
+      valid.push_back(g.get());
+    }
+  }
+  if (valid.empty()) {
+    return false;
+  }
+
+  const double res = static_cast<double>(valid[0]->info.resolution);
+  for (const auto* g : valid) {
+    if (std::abs(static_cast<double>(g->info.resolution) - res) > 1e-5) {
+      RCLCPP_WARN_THROTTLE(
+        logger_, *this->get_clock(), 5000,
+        "expand_slam_maps_to_common_canvas: resolutions differ; cannot merge.");
+      return false;
+    }
+  }
+
+  const double margin = expand_slam_maps_margin_m_;
+  double min_x = std::numeric_limits<double>::infinity();
+  double min_y = std::numeric_limits<double>::infinity();
+  double max_x = -std::numeric_limits<double>::infinity();
+  double max_y = -std::numeric_limits<double>::infinity();
+
+  for (const auto* map : valid) {
+    const double w = static_cast<double>(map->info.width);
+    const double h = static_cast<double>(map->info.height);
+    const std::vector<std::pair<double, double>> corners = {
+      {0.0, 0.0}, {w, 0.0}, {0.0, h}, {w, h}};
+    for (const auto& c : corners) {
+      double wx = 0.0;
+      double wy = 0.0;
+      /* Corners of the grid in world (map frame + origin); same idea as gingineer bottom_* offsets. */
+      tf2::Quaternion q;
+      tf2::fromMsg(map->info.origin.orientation, q);
+      tf2::Matrix3x3 R(q);
+      const double r = static_cast<double>(map->info.resolution);
+      tf2::Vector3 delta(c.first * r, c.second * r, 0.0);
+      tf2::Vector3 t(map->info.origin.position.x, map->info.origin.position.y, map->info.origin.position.z);
+      tf2::Vector3 p = t + R * delta;
+      wx = p.x();
+      wy = p.y();
+      min_x = std::min(min_x, wx);
+      min_y = std::min(min_y, wy);
+      max_x = std::max(max_x, wx);
+      max_y = std::max(max_y, wy);
+    }
+  }
+
+  min_x -= margin;
+  min_y -= margin;
+  max_x += margin;
+  max_y += margin;
+
+  const unsigned out_w = static_cast<unsigned>(std::ceil((max_x - min_x) / res + 1e-9));
+  const unsigned out_h = static_cast<unsigned>(std::ceil((max_y - min_y) / res + 1e-9));
+  if (out_w == 0U || out_h == 0U || out_w > 20000U || out_h > 20000U) {
+    RCLCPP_WARN(
+      logger_, "expand_slam_maps_to_common_canvas: invalid canvas size %u x %u", out_w, out_h);
+    return false;
+  }
+
+  for (const auto* map : valid) {
+    auto expanded = std::make_shared<nav_msgs::msg::OccupancyGrid>();
+    expanded->header = map->header;
+    expanded->info.map_load_time = map->info.map_load_time;
+    expanded->info.resolution = static_cast<float>(res);
+    expanded->info.width = out_w;
+    expanded->info.height = out_h;
+    expanded->info.origin.position.x = min_x;
+    expanded->info.origin.position.y = min_y;
+    expanded->info.origin.position.z = map->info.origin.position.z;
+    expanded->info.origin.orientation.w = 1.0;
+    expanded->info.origin.orientation.x = 0.0;
+    expanded->info.origin.orientation.y = 0.0;
+    expanded->info.origin.orientation.z = 0.0;
+    expanded->data.assign(static_cast<size_t>(out_w) * out_h, static_cast<int8_t>(-1));
+
+    const unsigned w = map->info.width;
+    const unsigned h = map->info.height;
+    for (unsigned iy = 0; iy < h; ++iy) {
+      for (unsigned ix = 0; ix < w; ++ix) {
+        double wx = 0.0;
+        double wy = 0.0;
+        mapCellCenterToWorldXY(*map, static_cast<double>(ix), static_cast<double>(iy), wx, wy);
+        const int oix = static_cast<int>(std::floor((wx - min_x) / res));
+        const int oiy = static_cast<int>(std::floor((wy - min_y) / res));
+        if (oix < 0 || oiy < 0 || oix >= static_cast<int>(out_w) || oiy >= static_cast<int>(out_h)) {
+          continue;
+        }
+        const size_t dst = static_cast<size_t>(oiy) * out_w + static_cast<size_t>(oix);
+        const size_t src = static_cast<size_t>(iy) * w + ix;
+        const int v = static_cast<int>(map->data[src]);
+        const int cur = static_cast<int>(expanded->data[dst]);
+        expanded->data[dst] = static_cast<int8_t>(std::max(cur, v));
+      }
+    }
+    out.push_back(std::move(expanded));
+  }
+
+  return true;
 }
 
 void MapMerge::poseEstimation()
@@ -309,10 +501,13 @@ void MapMerge::poseEstimation()
 // void MapMerge::fullMapUpdate(const nav_msgs::OccupancyGrid::ConstPtr& msg,
 //                              MapSubscription& subscription)
 void MapMerge::fullMapUpdate(const nav_msgs::msg::OccupancyGrid::SharedPtr msg,
-                     MapSubscription& subscription)
+                             MapSubscription& subscription, const std::string& robot_name)
 {
   RCLCPP_DEBUG(logger_, "received full map update");
   // RCLCPP_INFO(logger_, "received full map update");
+  if (msg->header.frame_id.empty() || msg->header.frame_id == "map") {
+    msg->header.frame_id = ros1_names::append(robot_name, "map");
+  }
   std::lock_guard<std::mutex> lock(subscription.mutex);
   if (subscription.readonly_map){
     // ros2 header .stamp don't support > operator, we need to create them explicitly
