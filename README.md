@@ -1,6 +1,6 @@
 # m-explore ROS2 port
 
-ROS2 package port for multi-robot autonomous exploration of [m-explore](https://github.com/hrnr/m-explore). Currently tested on Eloquent, Dashing, Foxy, and Galactic distros.
+ROS2 package port for multi-robot autonomous exploration of [m-explore](https://github.com/hrnr/m-explore). Targets **ROS 2 Humble** and newer.
 
 ### Contents
 1. [Autonomous exploration](#Autonomous-exploration)
@@ -66,8 +66,8 @@ By default the exploration node will start right away the frontier-based explora
 #### Returning to initial pose
 The robot will return to its initial pose after exploration if you want by defining the parameter `return_to_init` to `True` when launching the node.
 
-#### TB3 troubleshooting (with foxy)
-If you have trouble with TB3 in simulation, as we did, add these extra steps for configuring it.
+#### TB3 troubleshooting
+If you have trouble with TB3 in simulation, try replacing the packaged turtlebot3 simulations with the upstream repo:
 
 ```
 source /opt/ros/${ROS_DISTRO}/setup.bash
@@ -114,13 +114,6 @@ colcon build --symlink-install --packages-up-to slam_gmapping
 ```
 
 **Note**: You could use [slam_toolbox](https://github.com/SteveMacenski/slam_toolbox) instead but you need to use this [experimental branch](https://github.com/robo-friends/m-explore-ros2/tree/feature/slam_toolbox_compat) which is still under development.
-
-#### Nav2 gazebo spawner (deprecated in humble)
-To spawn multiple robots, you need the `nav2_gazebo_spawner` which does not come up with the `nav2-bringup` installation. For that, install it with `sudo apt install ros-${ROS_DISTRO}-nav2-gazebo-spawner`.
-Note that was the case for release previous to `humble` but since `humble` release, this package is deprecated and a gazebo node is used for this. So, if you are using `humble` or newer, you don't need to install it.
-
-#### Nav2 config files
-This repo has some config examples and launch files for running this package with 2 TB3 robots and a world with nav2. Nonetheless, they are only compatible with the galactic/humble distros and since some breaking changes were introduced in this distro, if you want to try it with another ros2 distro you'll need to tweak those param files for that nav2's distro version (which shouldn't be hard).
 
 ### Running the demo with TB3
 First, you'll need to launch the whole simulation stack, nav2 stacks and slam stacks per robot. For that just launch::
