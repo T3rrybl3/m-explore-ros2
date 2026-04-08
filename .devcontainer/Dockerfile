@@ -1,7 +1,4 @@
-# FROM nvidia/cuda:11.7.1-devel-ubuntu22.04
-FROM ubuntu:jammy
-# FROM nvidia/cuda:11.1.1-cudnn8-devel-ubuntu20.04
-# FROM ubuntu:focal
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND noninteractive
 
@@ -20,7 +17,6 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     curl  \
     gnupg2  \
     lsb-release \
-    ca-certificates \
     && apt autoremove -y && apt clean -y \
     && rm -rf /var/lib/apt/lists/*
 
