@@ -94,8 +94,6 @@ private:
   combine_grids::MergingPipeline pipeline_;
   std::mutex pipeline_mutex_;
 
-  std::vector<rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr> pad_publishers_;
-
   rclcpp::Logger logger_;
 
   // timers
@@ -112,7 +110,6 @@ private:
                      MapSubscription& map);
   void partialMapUpdate(const map_msgs::msg::OccupancyGridUpdate::SharedPtr msg,
                         MapSubscription& map);
-  void getMaxWidthHeightMaps(unsigned int& max_width, unsigned int& max_height);
 
 public:
   MapMerge();
