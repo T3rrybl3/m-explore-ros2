@@ -38,7 +38,7 @@ RUNNING
 -------
 To run with a params file just run it with
 ```
-ros2 run explore_lite explore --ros-args --params-file <path_to_ros_ws>/m-explore/explore/config/params.yaml
+ros2 run explore_lite explore --ros-args --params-file <path_to_ros_ws>/m-explore-ros2/explore/config/params.yaml
 ```
 
 ### Running the explore demo with TB3
@@ -49,7 +49,7 @@ Then just run the nav2 stack with slam:
 ```
 export TURTLEBOT3_MODEL=waffle
 export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:/opt/ros/${ROS_DISTRO}/share/turtlebot3_gazebo/models
-ros2 launch nav2_bringup tb3_simulation_launch.py slam:=true
+ros2 launch nav2_bringup tb3_simulation_launch.py slam:=True
 ```
 
 And run this package with
@@ -57,7 +57,14 @@ And run this package with
 ros2 launch explore_lite explore.launch.py
 ```
 
-You can open a rviz2 and add the exploration frontiers marker to see the algorithm working and choose a frontier to explore.
+You can open rviz2 and add the exploration frontiers marker (topic is `explore/frontiers`) to see the algorithm working and the frontier chosen to explore.
+
+### Additional features
+#### Stop/Resume exploration
+By default the exploration node will start right away the frontier-based exploration algorithm. Alternatively, you can stop the exploration by publishing to a `False` to `explore/resume` topic. This will stop the exploration and the robot will stop moving. You can resume the exploration by publishing to `True` to `explore/resume`.
+
+#### Returning to initial pose
+The robot will return to its initial pose after exploration if you want by defining the parameter `return_to_init` to `True` when launching the node.
 
 #### TB3 troubleshooting (with foxy)
 If you have trouble with TB3 in simulation, as we did, add these extra steps for configuring it.
@@ -108,10 +115,12 @@ colcon build --symlink-install --packages-up-to slam_gmapping
 
 **Note**: You could use [slam_toolbox](https://github.com/SteveMacenski/slam_toolbox) instead but you need to use this [experimental branch](https://github.com/robo-friends/m-explore-ros2/tree/feature/slam_toolbox_compat) which is still under development.
 
-#### Nav2 gazebo spawner
+#### Nav2 gazebo spawner (deprecated in humble)
 To spawn multiple robots, you need the `nav2_gazebo_spawner` which does not come up with the `nav2-bringup` installation. For that, install it with `sudo apt install ros-${ROS_DISTRO}-nav2-gazebo-spawner`.
+Note that was the case for release previous to `humble` but since `humble` release, this package is deprecated and a gazebo node is used for this. So, if you are using `humble` or newer, you don't need to install it.
+
 #### Nav2 config files
-This repo has some config examples and launch files for running this package with 2 TB3 robots and a world with nav2. Nonetheless, they are only compatible with the galactic branch and since some breaking changes were introduced in this branch, if you want to try it with another ros2 distro you'll need to tweak those param files for that nav2's distro version (which shouldn't be hard).
+This repo has some config examples and launch files for running this package with 2 TB3 robots and a world with nav2. Nonetheless, they are only compatible with the galactic/humble distros and since some breaking changes were introduced in this distro, if you want to try it with another ros2 distro you'll need to tweak those param files for that nav2's distro version (which shouldn't be hard).
 
 ### Running the demo with TB3
 First, you'll need to launch the whole simulation stack, nav2 stacks and slam stacks per robot. For that just launch::

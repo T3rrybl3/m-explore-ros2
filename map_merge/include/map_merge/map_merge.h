@@ -96,7 +96,7 @@ private:
 
   std::vector<rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr> pad_publishers_;
 
-  rclcpp::Logger logger_ = rclcpp::get_logger("MapMergeNode");
+  rclcpp::Logger logger_;
 
   // timers
   rclcpp::TimerBase::SharedPtr map_merging_timer_;

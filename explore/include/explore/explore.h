@@ -40,18 +40,17 @@
 
 #include <explore/costmap_client.h>
 #include <explore/frontier_search.h>
-#include <geometry_msgs/msg/pose_stamped.h>
-#include <tf2_ros/transform_listener.h>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <tf2_ros/transform_listener.hpp>
 
 #include <chrono>
 #include <cmath>
+#include <explore_lite_msgs/msg/explore_status.hpp>
 #include <geometry_msgs/msg/point.hpp>
-#include <memory>
-#include <mutex>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/color_rgba.hpp>
 #include <string>
-#include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
@@ -79,7 +78,8 @@ public:
   ~Explore();
 
   void start();
-  void stop();
+  void stop(bool finished_exploring = false);
+  void resume();
 
   using NavigationGoalHandle =
       rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>;
@@ -107,7 +107,13 @@ private:
 
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_array_publisher_;
-  rclcpp::Logger logger_ = rclcpp::get_logger("ExploreNode");
+
+  /**
+    * @brief Publisher for exploration status updates (see ExploreStatus.msg for status values)
+    */
+  rclcpp::Publisher<explore_lite_msgs::msg::ExploreStatus>::SharedPtr status_pub_;
+
+  rclcpp::Logger logger_;
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
 
@@ -118,17 +124,26 @@ private:
   rclcpp::TimerBase::SharedPtr exploring_timer_;
   // rclcpp::TimerBase::SharedPtr oneshot_;
 
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr resume_subscription_;
+  void resumeCallback(const std_msgs::msg::Bool::SharedPtr msg);
+
   std::vector<geometry_msgs::msg::Point> frontier_blacklist_;
   geometry_msgs::msg::Point prev_goal_;
   double prev_distance_;
   rclcpp::Time last_progress_;
   size_t last_markers_count_;
 
+  geometry_msgs::msg::Pose initial_pose_;
+  void returnToInitialPose(void);
+
   // parameters
   double planner_frequency_;
   double potential_scale_, orientation_scale_, gain_scale_;
   double progress_timeout_;
   bool visualize_;
+  bool return_to_init_;
+  std::string robot_base_frame_;
+  bool resuming_ = false;
 };
 }  // namespace explore
 

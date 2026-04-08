@@ -41,7 +41,7 @@
 #include <map_merge/map_merge.h>
 #include <map_merge/ros1_names.hpp>
 #include <rcpputils/asserts.hpp>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 nav_msgs::msg::OccupancyGrid::ConstSharedPtr pad_map(nav_msgs::msg::OccupancyGrid::ConstSharedPtr map, 
                                                       unsigned int width, unsigned int height)
@@ -175,7 +175,8 @@ namespace map_merge
 MapMerge::MapMerge() : Node("map_merge", rclcpp::NodeOptions()
                                        .allow_undeclared_parameters(true)
                                        .automatically_declare_parameters_from_overrides(true)),
-subscriptions_size_(0)
+subscriptions_size_(0),
+logger_(this->get_logger())
 {
   std::string frame_id;
   std::string merged_map_topic;
@@ -190,7 +191,7 @@ subscriptions_size_(0)
   if (!this->has_parameter("robot_namespace")) this->declare_parameter<std::string>("robot_namespace", "");
   if (!this->has_parameter("merged_map_topic")) this->declare_parameter<std::string>("merged_map_topic", "map");
   if (!this->has_parameter("world_frame")) this->declare_parameter<std::string>("world_frame", "world");
-  
+
   this->get_parameter("merging_rate", merging_rate_);
   this->get_parameter("discovery_rate", discovery_rate_);
   this->get_parameter("estimation_rate", estimation_rate_);
@@ -206,7 +207,7 @@ subscriptions_size_(0)
   /* publishing */
   // Create a publisher using the QoS settings to emulate a ROS1 latched topic
   merged_map_publisher_ =
-      this->create_publisher<nav_msgs::msg::OccupancyGrid>(merged_map_topic, 
+      this->create_publisher<nav_msgs::msg::OccupancyGrid>(merged_map_topic,
       rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable());
 
   // Timers
@@ -214,7 +215,7 @@ subscriptions_size_(0)
     std::chrono::milliseconds((uint16_t)(1000.0 / merging_rate_)),
     [this]() { mapMerging(); });
   // execute right away to simulate the ros1 first while loop on a thread
-  map_merging_timer_->execute_callback();
+  mapMerging();
 
   topic_subscribing_timer_ = this->create_wall_timer(
     std::chrono::milliseconds((uint16_t)(1000.0 / discovery_rate_)),
@@ -228,19 +229,19 @@ subscriptions_size_(0)
     r.sleep();
     i++;
   }
-  topic_subscribing_timer_->execute_callback(); 
+  topicSubscribing();
 
   if (!have_initial_poses_){
     pose_estimation_timer_ = this->create_wall_timer(
       std::chrono::milliseconds((uint16_t)(1000.0 / estimation_rate_)),
       [this]() { poseEstimation(); });
     // execute right away to simulate the ros1 first while loop on a thread
-    pose_estimation_timer_->execute_callback(); 
+    poseEstimation();
   }
 }
 
 /*
- * Subcribe to pose and map topics
+ * Subscribe to pose and map topics
  */
 void MapMerge::topicSubscribing()
 {
@@ -267,7 +268,7 @@ void MapMerge::topicSubscribing()
       if (!isRobotMapTopic(topic_name, topic_type)) {
         continue;
       }
-    
+
       robot_name = robotNameFromTopic(topic_name);
       if (robots_.count(robot_name)) {
         // we already know this robot
@@ -396,7 +397,7 @@ void MapMerge::mapMerging()
   nav_msgs::msg::OccupancyGrid::SharedPtr merged_map;
   {
     std::lock_guard<std::mutex> lock(pipeline_mutex_);
-    merged_map = pipeline_.composeGrids();
+    merged_map = pipeline_.composeGrids(logger_);
   }
   if (!merged_map) {
     // RCLCPP_INFO(logger_, "No map merged");
@@ -436,11 +437,11 @@ void MapMerge::poseEstimation()
   std::lock_guard<std::mutex> lock(pipeline_mutex_);
   pipeline_.feed(grids.begin(), grids.end());
   // TODO allow user to change feature type
-  bool success = pipeline_.estimateTransforms(combine_grids::FeatureType::AKAZE,
+  bool success = pipeline_.estimateTransforms(logger_,combine_grids::FeatureType::AKAZE,
                                confidence_threshold_);
-  // bool success = pipeline_.estimateTransforms(combine_grids::FeatureType::SURF,
+  // bool success = pipeline_.estimateTransforms(logger_, combine_grids::FeatureType::SURF,
   //                              confidence_threshold_);
-  // bool success = pipeline_.estimateTransforms(combine_grids::FeatureType::ORB,
+  // bool success = pipeline_.estimateTransforms(logger_, combine_grids::FeatureType::ORB,
   //                              confidence_threshold_);
   if (!success) {
     RCLCPP_INFO(logger_, "No grid poses estimated");
@@ -567,7 +568,7 @@ bool MapMerge::isRobotMapTopic(const std::string topic, std::string type)
   // /* we support only occupancy grids as maps */
   bool is_occupancy_grid = type == "nav_msgs/msg/OccupancyGrid";
 
-  // /* we don't want to subcribe on published merged map */
+  // /* we don't want to subscribe on published merged map */
   bool is_our_topic = merged_map_publisher_->get_topic_name() == topic;
 
   return is_occupancy_grid && !is_our_topic && contains_robot_namespace &&
@@ -605,12 +606,12 @@ int main(int argc, char** argv)
 {
   rclcpp::init(argc, argv);
   // ROS1 code
-  // // this package is still in development -- start wil debugging enabled
+  // // this package is still in development -- start with debugging enabled
   // if (ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME,
   //                                    ros::console::levels::Debug)) {
   //   ros::console::notifyLoggerLevelsChanged();
   // }
-  
+
   // ROS2 code
   auto node = std::make_shared<map_merge::MapMerge>();
   rclcpp::spin(node);
