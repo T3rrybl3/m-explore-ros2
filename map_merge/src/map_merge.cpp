@@ -288,8 +288,7 @@ void MapMerge::mapMerging()
         did_expand = true;
         RCLCPP_INFO_ONCE(
           logger_,
-          "SLAM map expansion: embedded all robot maps in one common grid (map.info only; see issue #10 / "
-          "gingineer map_expansion).");
+          "SLAM map expansion: embedded all robot maps in one common grid (map.info only");
       }
     }
 
