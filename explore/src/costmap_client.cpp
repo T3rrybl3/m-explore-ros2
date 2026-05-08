@@ -62,11 +62,14 @@ Costmap2DClient::Costmap2DClient(rclcpp::Node& node, const tf2_ros::Buffer* tf)
                                                                        "link"));
   // transform tolerance is used for all tf transforms here
   node_.declare_parameter<double>("transform_tolerance", 0.3);
+  node_.declare_parameter<std::string>("robot_pose_stamp_mode",
+                                       std::string("now"));
 
   node_.get_parameter("costmap_topic", costmap_topic);
   node_.get_parameter("costmap_updates_topic", costmap_updates_topic);
   node_.get_parameter("robot_base_frame", robot_base_frame_);
   node_.get_parameter("transform_tolerance", transform_tolerance_);
+  node_.get_parameter("robot_pose_stamp_mode", robot_pose_stamp_mode_);
 
   /* initialize costmap */
   costmap_sub_ = node_.create_subscription<nav_msgs::msg::OccupancyGrid>(
@@ -224,7 +227,12 @@ geometry_msgs::msg::Pose Costmap2DClient::getRobotPose() const
   geometry_msgs::msg::PoseStamped robot_pose;
   geometry_msgs::msg::Pose empty_pose;
   robot_pose.header.frame_id = robot_base_frame_;
-  robot_pose.header.stamp = node_.now();
+  if (robot_pose_stamp_mode_ == "latest") {
+    robot_pose.header.stamp =
+        rclcpp::Time(0, 0, node_.get_clock()->get_clock_type());
+  } else {
+    robot_pose.header.stamp = node_.now();
+  }
 
   auto& clk = *node_.get_clock();
 

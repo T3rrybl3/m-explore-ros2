@@ -70,6 +70,7 @@ Explore::Explore()
   this->declare_parameter<float>("gain_scale", 1.0);
   this->declare_parameter<float>("min_frontier_size", 0.5);
   this->declare_parameter<bool>("return_to_init", false);
+  this->declare_parameter<std::string>("goal_stamp_mode", std::string("now"));
 
   this->get_parameter("planner_frequency", planner_frequency_);
   this->get_parameter("progress_timeout", timeout);
@@ -80,6 +81,7 @@ Explore::Explore()
   this->get_parameter("min_frontier_size", min_frontier_size);
   this->get_parameter("return_to_init", return_to_init_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
+  this->get_parameter("goal_stamp_mode", goal_stamp_mode_);
 
   progress_timeout_ = timeout;
   move_base_client_ =
@@ -302,7 +304,12 @@ void Explore::makePlan()
   goal.pose.pose.position = target_position;
   goal.pose.pose.orientation.w = 1.;
   goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
-  goal.pose.header.stamp = this->now();
+  if (goal_stamp_mode_ == "latest") {
+    goal.pose.header.stamp =
+        rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
+  } else {
+    goal.pose.header.stamp = this->now();
+  }
 
   auto send_goal_options =
       rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
@@ -329,7 +336,12 @@ void Explore::returnToInitialPose()
   goal.pose.pose.position = initial_pose_.position;
   goal.pose.pose.orientation = initial_pose_.orientation;
   goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
-  goal.pose.header.stamp = this->now();
+  if (goal_stamp_mode_ == "latest") {
+    goal.pose.header.stamp =
+        rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
+  } else {
+    goal.pose.header.stamp = this->now();
+  }
 
   auto send_goal_options =
       rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();

@@ -124,6 +124,7 @@ protected:
   std::string global_frame_;      ///< @brief The global frame for the costmap
   std::string robot_base_frame_;  ///< @brief The frame_id of the robot base
   double transform_tolerance_;    ///< timeout before transform errors
+  std::string robot_pose_stamp_mode_;
 
 private:
   // will be unsubscribed at destruction
