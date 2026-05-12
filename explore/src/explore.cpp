@@ -234,31 +234,12 @@ void Explore::makePlan()
   auto pose = costmap_client_.getRobotPose();
   // get frontiers sorted according to cost
   auto frontiers = search_.searchFrom(pose.position);
-  size_t blacklisted_frontiers = 0;
-  for (const auto& frontier : frontiers) {
-    if (goalOnBlacklist(frontier.centroid)) {
-      ++blacklisted_frontiers;
-    }
-  }
-  RCLCPP_INFO(
-      logger_,
-      "explore_frontier_search frontiers_found=%zu blacklist_size=%zu "
-      "blacklisted_frontiers=%zu robot_pose=(%.3f, %.3f, %.3f)",
-      frontiers.size(), frontier_blacklist_.size(), blacklisted_frontiers,
-      pose.position.x, pose.position.y, pose.position.z);
   RCLCPP_DEBUG(logger_, "found %lu frontiers", frontiers.size());
   for (size_t i = 0; i < frontiers.size(); ++i) {
     RCLCPP_DEBUG(logger_, "frontier %zd cost: %f", i, frontiers[i].cost);
   }
 
   if (frontiers.empty()) {
-    RCLCPP_WARN(
-        logger_,
-        "explore_frontier_exhausted frontiers_found=0 blacklist_size=%zu "
-        "blacklisted_frontiers=0 all_frontiers_blacklisted=false "
-        "no_frontiers_found=true robot_pose=(%.3f, %.3f, %.3f)",
-        frontier_blacklist_.size(), pose.position.x, pose.position.y,
-        pose.position.z);
     RCLCPP_WARN(logger_, "No frontiers found, stopping.");
     auto status_msg = explore_lite_msgs::msg::ExploreStatus();
     status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
@@ -279,13 +260,6 @@ void Explore::makePlan()
                          return goalOnBlacklist(f.centroid);
                        });
   if (frontier == frontiers.end()) {
-    RCLCPP_WARN(
-        logger_,
-        "explore_frontier_exhausted frontiers_found=%zu blacklist_size=%zu "
-        "blacklisted_frontiers=%zu all_frontiers_blacklisted=true "
-        "no_frontiers_found=false robot_pose=(%.3f, %.3f, %.3f)",
-        frontiers.size(), frontier_blacklist_.size(), blacklisted_frontiers,
-        pose.position.x, pose.position.y, pose.position.z);
     RCLCPP_WARN(logger_, "All frontiers traversed/tried out, stopping.");
     auto status_msg = explore_lite_msgs::msg::ExploreStatus();
     status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
@@ -308,14 +282,6 @@ void Explore::makePlan()
   if ((this->now() - last_progress_ >
       tf2::durationFromSec(progress_timeout_)) && !resuming_) {
     frontier_blacklist_.push_back(target_position);
-    RCLCPP_WARN(
-        logger_,
-        "explore_frontier_blacklisted reason=progress_timeout "
-        "goal=(%.3f, %.3f, %.3f) blacklist_size=%zu "
-        "progress_timeout=%.3f elapsed=%.3f min_distance=%.3f",
-        target_position.x, target_position.y, target_position.z,
-        frontier_blacklist_.size(), progress_timeout_,
-        (this->now() - last_progress_).seconds(), frontier->min_distance);
     RCLCPP_DEBUG(logger_, "Adding current goal to black list");
     makePlan();
     return;
@@ -417,12 +383,6 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
     case rclcpp_action::ResultCode::ABORTED:
       RCLCPP_DEBUG(logger_, "Goal was aborted");
       frontier_blacklist_.push_back(frontier_goal);
-      RCLCPP_WARN(
-          logger_,
-          "explore_frontier_blacklisted reason=action_result code=aborted "
-          "goal=(%.3f, %.3f, %.3f) blacklist_size=%zu",
-          frontier_goal.x, frontier_goal.y, frontier_goal.z,
-          frontier_blacklist_.size());
       RCLCPP_DEBUG(logger_, "Adding current goal to black list");
       // If it was aborted probably because we've found another frontier goal,
       // so just return and don't make plan again
