@@ -95,6 +95,10 @@ private:
   //  */
   void visualizeFrontiers(
       const std::vector<frontier_exploration::Frontier>& frontiers);
+  void visualizeDebugFrontiers(
+      const frontier_exploration::FrontierSearchResult& search_result,
+      const std::vector<frontier_exploration::Frontier>& blacklisted_frontiers,
+      const frontier_exploration::Frontier* selected_frontier);
 
   bool goalOnBlacklist(const geometry_msgs::msg::Point& goal);
 
@@ -107,6 +111,12 @@ private:
 
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_array_publisher_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      raw_frontier_marker_publisher_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      filtered_frontier_marker_publisher_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      blacklisted_frontier_marker_publisher_;
 
   /**
     * @brief Publisher for exploration status updates (see ExploreStatus.msg for status values)
@@ -140,11 +150,34 @@ private:
   double planner_frequency_;
   double potential_scale_, orientation_scale_, gain_scale_;
   double progress_timeout_;
+  double min_frontier_size_;
   bool visualize_;
   bool return_to_init_;
+  bool debug_frontier_search_;
+  bool publish_debug_frontiers_;
   std::string robot_base_frame_;
   std::string goal_stamp_mode_;
   bool resuming_ = false;
+
+  void logFrontierDebug(
+      const frontier_exploration::FrontierSearchResult& search_result,
+      size_t blacklist_filtered, size_t remaining,
+      const frontier_exploration::Frontier* selected_frontier,
+      const std::string& stop_reason);
+  void logMinSizeRejectedFrontiers(
+      const frontier_exploration::FrontierSearchResult& search_result);
+  void logAllBlacklistedDetails(
+      const std::vector<frontier_exploration::Frontier>& frontiers);
+  void logBlacklistAdded(const geometry_msgs::msg::Point& goal,
+                         const std::string& reason);
+  void publishFrontierDebugMarkers(
+      const rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr& publisher,
+      const std::vector<frontier_exploration::Frontier>& frontiers,
+      const std::string& marker_namespace,
+      const std_msgs::msg::ColorRGBA& point_color,
+      const std_msgs::msg::ColorRGBA& centroid_color,
+      const frontier_exploration::Frontier* selected_frontier = nullptr);
+  std::string formatPoint(const geometry_msgs::msg::Point& point) const;
 };
 }  // namespace explore
 

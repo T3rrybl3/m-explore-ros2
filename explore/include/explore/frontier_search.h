@@ -1,6 +1,9 @@
 #ifndef FRONTIER_SEARCH_H_
 #define FRONTIER_SEARCH_H_
 
+#include <string>
+#include <vector>
+
 #include "nav2_costmap_2d/costmap_2d_ros.hpp"
 
 namespace frontier_exploration
@@ -17,6 +20,22 @@ struct Frontier {
   geometry_msgs::msg::Point centroid;
   geometry_msgs::msg::Point middle;
   std::vector<geometry_msgs::msg::Point> points;
+};
+
+struct FrontierSearchResult {
+  bool valid = true;
+  std::string invalid_reason;
+  double resolution = 0.0;
+  unsigned int width = 0;
+  unsigned int height = 0;
+  bool robot_cell_valid = false;
+  unsigned int robot_mx = 0;
+  unsigned int robot_my = 0;
+  int robot_occupancy = -1;
+  unsigned int unknown_cell_count = 0;
+  std::vector<Frontier> raw_frontiers;
+  std::vector<Frontier> min_size_rejected_frontiers;
+  std::vector<Frontier> filtered_frontiers;
 };
 
 /**
@@ -41,6 +60,8 @@ public:
    * @return List of frontiers, if any
    */
   std::vector<Frontier> searchFrom(geometry_msgs::msg::Point position);
+
+  FrontierSearchResult searchFromWithDiagnostics(geometry_msgs::msg::Point position);
 
 protected:
   /**
