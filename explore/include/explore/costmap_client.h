@@ -43,10 +43,14 @@
 
 #include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <builtin_interfaces/msg/time.hpp>
 #include <map_msgs/msg/occupancy_grid_update.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <cstdint>
+#include <mutex>
+#include <string>
 #include "nav2_costmap_2d/costmap_2d_ros.hpp"
 
 namespace explore
@@ -54,6 +58,14 @@ namespace explore
 class Costmap2DClient
 {
 public:
+  struct MapUpdateMetadata
+  {
+    uint64_t sequence = 0;
+    builtin_interfaces::msg::Time last_header_stamp;
+    builtin_interfaces::msg::Time last_receive_time;
+    std::string update_source = "none";
+  };
+
   /**
    * @brief Constructs client and start listening
    * @details Constructor will block until first map update is received and
@@ -110,6 +122,8 @@ public:
     return robot_base_frame_;
   }
 
+  MapUpdateMetadata getMapUpdateMetadata() const;
+
 protected:
   void updateFullMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
   void updatePartialMap(const map_msgs::msg::OccupancyGridUpdate::SharedPtr msg);
@@ -131,6 +145,10 @@ private:
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr costmap_sub_;
   rclcpp::Subscription<map_msgs::msg::OccupancyGridUpdate>::SharedPtr
       costmap_updates_sub_;
+  void updateMapMetadata(const builtin_interfaces::msg::Time& header_stamp,
+                         const std::string& update_source);
+  mutable std::mutex map_metadata_mutex_;
+  MapUpdateMetadata map_metadata_;
 };
 
 }  // namespace explore

@@ -173,6 +173,7 @@ void Costmap2DClient::updateFullMap(
   }
   RCLCPP_DEBUG(node_.get_logger(), "map updated, written %lu values",
                costmap_size);
+  updateMapMetadata(msg->header.stamp, "full");
 }
 
 void Costmap2DClient::updatePartialMap(
@@ -220,6 +221,7 @@ void Costmap2DClient::updatePartialMap(
       ++i;
     }
   }
+  updateMapMetadata(msg->header.stamp, "partial");
 }
 
 geometry_msgs::msg::Pose Costmap2DClient::getRobotPose() const
@@ -263,6 +265,28 @@ geometry_msgs::msg::Pose Costmap2DClient::getRobotPose() const
   }
 
   return robot_pose.pose;
+}
+
+Costmap2DClient::MapUpdateMetadata
+Costmap2DClient::getMapUpdateMetadata() const
+{
+  std::lock_guard<std::mutex> lock(map_metadata_mutex_);
+  return map_metadata_;
+}
+
+void Costmap2DClient::updateMapMetadata(
+    const builtin_interfaces::msg::Time& header_stamp,
+    const std::string& update_source)
+{
+  std::lock_guard<std::mutex> lock(map_metadata_mutex_);
+  ++map_metadata_.sequence;
+  map_metadata_.last_header_stamp = header_stamp;
+  const int64_t receive_time_ns = node_.now().nanoseconds();
+  map_metadata_.last_receive_time.sec =
+      static_cast<int32_t>(receive_time_ns / 1000000000LL);
+  map_metadata_.last_receive_time.nanosec =
+      static_cast<uint32_t>(receive_time_ns % 1000000000LL);
+  map_metadata_.update_source = update_source;
 }
 
 std::array<unsigned char, 256> init_translation_table()

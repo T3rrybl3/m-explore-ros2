@@ -53,6 +53,7 @@
 #include <string>
 #include <visualization_msgs/msg/marker_array.hpp>
 
+#include <cstdint>
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 
@@ -132,6 +133,7 @@ private:
       move_base_client_;
   frontier_exploration::FrontierSearch search_;
   rclcpp::TimerBase::SharedPtr exploring_timer_;
+  rclcpp::TimerBase::SharedPtr unknown_robot_cell_retry_timer_;
   // rclcpp::TimerBase::SharedPtr oneshot_;
 
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr resume_subscription_;
@@ -155,9 +157,15 @@ private:
   bool return_to_init_;
   bool debug_frontier_search_;
   bool publish_debug_frontiers_;
+  bool enable_unknown_robot_cell_frontier_retry_;
+  double unknown_robot_cell_retry_timeout_sec_;
+  int unknown_robot_cell_retry_min_map_updates_;
   std::string robot_base_frame_;
   std::string goal_stamp_mode_;
   bool resuming_ = false;
+  bool unknown_robot_cell_retry_active_ = false;
+  uint64_t unknown_robot_cell_retry_start_sequence_ = 0;
+  rclcpp::Time unknown_robot_cell_retry_start_time_;
 
   void logFrontierDebug(
       const frontier_exploration::FrontierSearchResult& search_result,
@@ -177,6 +185,15 @@ private:
       const std_msgs::msg::ColorRGBA& point_color,
       const std_msgs::msg::ColorRGBA& centroid_color,
       const frontier_exploration::Frontier* selected_frontier = nullptr);
+  bool shouldDeferUnknownRobotCellTerminalDecision(
+      const frontier_exploration::FrontierSearchResult& search_result,
+      const std::string& stop_reason);
+  bool unknownRobotCellRetryReady(
+      const Costmap2DClient::MapUpdateMetadata& metadata);
+  uint64_t unknownRobotCellRetryMapUpdates(
+      const Costmap2DClient::MapUpdateMetadata& metadata) const;
+  void ensureUnknownRobotCellRetryTimer();
+  void clearUnknownRobotCellRetry(const std::string& reason);
   std::string formatPoint(const geometry_msgs::msg::Point& point) const;
 };
 }  // namespace explore

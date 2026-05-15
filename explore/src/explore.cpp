@@ -68,6 +68,15 @@ inline static const char* result_code_name(rclcpp_action::ResultCode code)
   }
 }
 
+inline static bool is_unknown_robot_cell_terminal_reason(
+    const std::string& stop_reason)
+{
+  return stop_reason == "no_raw_frontiers" ||
+      stop_reason == "unknown_not_adjacent_to_free" ||
+      stop_reason == "all_filtered_by_min_size" ||
+      stop_reason == "all_blacklisted";
+}
+
 namespace explore
 {
 Explore::Explore()
@@ -92,6 +101,10 @@ Explore::Explore()
   this->declare_parameter<std::string>("goal_stamp_mode", std::string("now"));
   this->declare_parameter<bool>("debug_frontier_search", false);
   this->declare_parameter<bool>("publish_debug_frontiers", false);
+  this->declare_parameter<bool>("enable_unknown_robot_cell_frontier_retry",
+                                false);
+  this->declare_parameter<double>("unknown_robot_cell_retry_timeout_sec", 8.0);
+  this->declare_parameter<int>("unknown_robot_cell_retry_min_map_updates", 1);
 
   this->get_parameter("planner_frequency", planner_frequency_);
   this->get_parameter("progress_timeout", timeout);
@@ -105,9 +118,19 @@ Explore::Explore()
   this->get_parameter("goal_stamp_mode", goal_stamp_mode_);
   this->get_parameter("debug_frontier_search", debug_frontier_search_);
   this->get_parameter("publish_debug_frontiers", publish_debug_frontiers_);
+  this->get_parameter("enable_unknown_robot_cell_frontier_retry",
+                      enable_unknown_robot_cell_frontier_retry_);
+  this->get_parameter("unknown_robot_cell_retry_timeout_sec",
+                      unknown_robot_cell_retry_timeout_sec_);
+  this->get_parameter("unknown_robot_cell_retry_min_map_updates",
+                      unknown_robot_cell_retry_min_map_updates_);
 
   progress_timeout_ = timeout;
   min_frontier_size_ = min_frontier_size;
+  unknown_robot_cell_retry_timeout_sec_ =
+      std::max(0.0, unknown_robot_cell_retry_timeout_sec_);
+  unknown_robot_cell_retry_min_map_updates_ =
+      std::max(1, unknown_robot_cell_retry_min_map_updates_);
   move_base_client_ =
       rclcpp_action::create_client<nav2_msgs::action::NavigateToPose>(
           this, ACTION_NAME);
@@ -384,6 +407,10 @@ void Explore::makePlan()
     if (publish_debug_frontiers_) {
       visualizeDebugFrontiers(search_result, {}, nullptr);
     }
+    if (shouldDeferUnknownRobotCellTerminalDecision(search_result,
+                                                    stop_reason)) {
+      return;
+    }
     RCLCPP_WARN(logger_, "No frontiers found, stopping.");
     auto status_msg = explore_lite_msgs::msg::ExploreStatus();
     status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
@@ -420,6 +447,10 @@ void Explore::makePlan()
     if (publish_debug_frontiers_) {
       visualizeDebugFrontiers(search_result, blacklisted_frontiers, nullptr);
     }
+    if (shouldDeferUnknownRobotCellTerminalDecision(search_result,
+                                                    "all_blacklisted")) {
+      return;
+    }
     RCLCPP_WARN(logger_, "All frontiers traversed/tried out, stopping.");
     auto status_msg = explore_lite_msgs::msg::ExploreStatus();
     status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
@@ -434,6 +465,7 @@ void Explore::makePlan()
   if (publish_debug_frontiers_) {
     visualizeDebugFrontiers(search_result, blacklisted_frontiers, &(*frontier));
   }
+  clearUnknownRobotCellRetry("remaining_frontiers_available");
   geometry_msgs::msg::Point target_position = frontier->centroid;
 
   // time out if we are not making any progress
@@ -505,6 +537,159 @@ void Explore::makePlan()
         reachedGoal(result, target_position);
       };
   move_base_client_->async_send_goal(goal, send_goal_options);
+}
+
+bool Explore::shouldDeferUnknownRobotCellTerminalDecision(
+    const frontier_exploration::FrontierSearchResult& search_result,
+    const std::string& stop_reason)
+{
+  if (!enable_unknown_robot_cell_frontier_retry_) {
+    return false;
+  }
+
+  if (!is_unknown_robot_cell_terminal_reason(stop_reason)) {
+    return false;
+  }
+
+  if (!search_result.robot_cell_valid || search_result.robot_occupancy != 255) {
+    clearUnknownRobotCellRetry("robot_cell_not_unknown");
+    return false;
+  }
+
+  const auto metadata = costmap_client_.getMapUpdateMetadata();
+  if (!unknown_robot_cell_retry_active_) {
+    unknown_robot_cell_retry_active_ = true;
+    unknown_robot_cell_retry_start_sequence_ = metadata.sequence;
+    unknown_robot_cell_retry_start_time_ = this->now();
+    ensureUnknownRobotCellRetryTimer();
+    RCLCPP_WARN(
+        logger_,
+        "explore_unknown_robot_cell_retry_started stop_reason=%s "
+        "robot_occupancy=%d start_sequence=%llu current_sequence=%llu "
+        "required_map_updates=%d timeout_sec=%.3f map_update_source=%s",
+        stop_reason.c_str(), search_result.robot_occupancy,
+        static_cast<unsigned long long>(
+            unknown_robot_cell_retry_start_sequence_),
+        static_cast<unsigned long long>(metadata.sequence),
+        unknown_robot_cell_retry_min_map_updates_,
+        unknown_robot_cell_retry_timeout_sec_, metadata.update_source.c_str());
+    return true;
+  }
+
+  if (unknownRobotCellRetryReady(metadata)) {
+    RCLCPP_INFO(
+        logger_,
+        "explore_unknown_robot_cell_retry_ready stop_reason=%s "
+        "robot_occupancy=%d start_sequence=%llu current_sequence=%llu "
+        "map_updates=%llu required_map_updates=%d elapsed_sec=%.3f "
+        "timeout_sec=%.3f map_update_source=%s",
+        stop_reason.c_str(), search_result.robot_occupancy,
+        static_cast<unsigned long long>(
+            unknown_robot_cell_retry_start_sequence_),
+        static_cast<unsigned long long>(metadata.sequence),
+        static_cast<unsigned long long>(
+            unknownRobotCellRetryMapUpdates(metadata)),
+        unknown_robot_cell_retry_min_map_updates_,
+        (this->now() - unknown_robot_cell_retry_start_time_).seconds(),
+        unknown_robot_cell_retry_timeout_sec_, metadata.update_source.c_str());
+    clearUnknownRobotCellRetry("retry_ready");
+    return false;
+  }
+
+  ensureUnknownRobotCellRetryTimer();
+  RCLCPP_INFO_THROTTLE(
+      logger_, *this->get_clock(), 2000,
+      "explore_unknown_robot_cell_retry_deferred stop_reason=%s "
+      "robot_occupancy=%d start_sequence=%llu current_sequence=%llu "
+      "map_updates=%llu required_map_updates=%d elapsed_sec=%.3f "
+      "timeout_sec=%.3f map_update_source=%s",
+      stop_reason.c_str(), search_result.robot_occupancy,
+      static_cast<unsigned long long>(unknown_robot_cell_retry_start_sequence_),
+      static_cast<unsigned long long>(metadata.sequence),
+      static_cast<unsigned long long>(unknownRobotCellRetryMapUpdates(metadata)),
+      unknown_robot_cell_retry_min_map_updates_,
+      (this->now() - unknown_robot_cell_retry_start_time_).seconds(),
+      unknown_robot_cell_retry_timeout_sec_, metadata.update_source.c_str());
+  return true;
+}
+
+bool Explore::unknownRobotCellRetryReady(
+    const Costmap2DClient::MapUpdateMetadata& metadata)
+{
+  if (!unknown_robot_cell_retry_active_) {
+    return false;
+  }
+
+  if (unknownRobotCellRetryMapUpdates(metadata) >=
+      static_cast<uint64_t>(unknown_robot_cell_retry_min_map_updates_)) {
+    return true;
+  }
+
+  return (this->now() - unknown_robot_cell_retry_start_time_).seconds() >=
+      unknown_robot_cell_retry_timeout_sec_;
+}
+
+uint64_t Explore::unknownRobotCellRetryMapUpdates(
+    const Costmap2DClient::MapUpdateMetadata& metadata) const
+{
+  if (metadata.sequence <= unknown_robot_cell_retry_start_sequence_) {
+    return 0;
+  }
+  return metadata.sequence - unknown_robot_cell_retry_start_sequence_;
+}
+
+void Explore::ensureUnknownRobotCellRetryTimer()
+{
+  if (unknown_robot_cell_retry_timer_ &&
+      !unknown_robot_cell_retry_timer_->is_canceled()) {
+    return;
+  }
+
+  unknown_robot_cell_retry_timer_ = this->create_wall_timer(
+      std::chrono::milliseconds(250), [this]() {
+        if (!unknown_robot_cell_retry_active_) {
+          if (unknown_robot_cell_retry_timer_) {
+            unknown_robot_cell_retry_timer_->cancel();
+          }
+          return;
+        }
+
+        const auto metadata = costmap_client_.getMapUpdateMetadata();
+        if (!unknownRobotCellRetryReady(metadata)) {
+          return;
+        }
+
+        if (unknown_robot_cell_retry_timer_) {
+          unknown_robot_cell_retry_timer_->cancel();
+        }
+        makePlan();
+      });
+}
+
+void Explore::clearUnknownRobotCellRetry(const std::string& reason)
+{
+  if (!unknown_robot_cell_retry_active_) {
+    return;
+  }
+
+  const auto metadata = costmap_client_.getMapUpdateMetadata();
+  RCLCPP_INFO(
+      logger_,
+      "explore_unknown_robot_cell_retry_cleared reason=%s "
+      "start_sequence=%llu current_sequence=%llu map_updates=%llu "
+      "elapsed_sec=%.3f map_update_source=%s",
+      reason.c_str(),
+      static_cast<unsigned long long>(unknown_robot_cell_retry_start_sequence_),
+      static_cast<unsigned long long>(metadata.sequence),
+      static_cast<unsigned long long>(unknownRobotCellRetryMapUpdates(metadata)),
+      (this->now() - unknown_robot_cell_retry_start_time_).seconds(),
+      metadata.update_source.c_str());
+
+  unknown_robot_cell_retry_active_ = false;
+  unknown_robot_cell_retry_start_sequence_ = 0;
+  if (unknown_robot_cell_retry_timer_) {
+    unknown_robot_cell_retry_timer_->cancel();
+  }
 }
 
 void Explore::returnToInitialPose()
@@ -759,6 +944,7 @@ void Explore::stop(bool finished_exploring)
 
   move_base_client_->async_cancel_all_goals();
   exploring_timer_->cancel();
+  clearUnknownRobotCellRetry("exploration_stopped");
 
   if (return_to_init_ && finished_exploring) {
     returnToInitialPose();
