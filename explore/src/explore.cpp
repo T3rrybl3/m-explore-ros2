@@ -683,17 +683,6 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
       std::string::npos;
   const bool proxy_soft_abort =
       blocked_by_preemption_guard || preempted_by_newer_goal;
-  const bool retryable_effective_only_reached =
-      nav2_error_msg.find("retryable_effective_only_reached") !=
-      std::string::npos;
-  const bool effective_staging_stuck =
-      nav2_error_msg.find("aborted_effective_staging_stuck") !=
-      std::string::npos;
-  const bool original_unreachable =
-      nav2_error_msg.find("aborted_original_unreachable") !=
-      std::string::npos;
-  const bool retryable_staging_abort =
-      retryable_effective_only_reached || effective_staging_stuck;
 
   RCLCPP_INFO(logger_,
               "explore_nav2_result target=%s result_code=%s "
@@ -720,27 +709,6 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
                     "nav2_error_msg='%s'",
                     formatPoint(frontier_goal).c_str(), nav2_error_code,
                     nav2_error_msg.c_str());
-        return;
-      }
-      if (retryable_staging_abort) {
-        prev_goal_.x = std::numeric_limits<double>::quiet_NaN();
-        prev_goal_.y = std::numeric_limits<double>::quiet_NaN();
-        prev_goal_.z = std::numeric_limits<double>::quiet_NaN();
-        RCLCPP_INFO(logger_,
-                    "explore_frontier_blacklist_skipped "
-                    "reason=%s target=%s nav2_error_code=%u "
-                    "nav2_error_msg='%s'",
-                    retryable_effective_only_reached ?
-                        "retryable_effective_only_reached" :
-                        "aborted_effective_staging_stuck",
-                    formatPoint(frontier_goal).c_str(), nav2_error_code,
-                    nav2_error_msg.c_str());
-        return;
-      }
-      if (original_unreachable) {
-        frontier_blacklist_.push_back(frontier_goal);
-        logBlacklistAdded(frontier_goal, "original_unreachable");
-        RCLCPP_DEBUG(logger_, "Adding current goal to black list");
         return;
       }
       frontier_blacklist_.push_back(frontier_goal);
