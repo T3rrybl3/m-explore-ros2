@@ -47,6 +47,7 @@
 #include <cmath>
 #include <explore_lite_msgs/msg/explore_status.hpp>
 #include <geometry_msgs/msg/point.hpp>
+#include <limits>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/color_rgba.hpp>
@@ -54,6 +55,7 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include <cstdint>
+#include "nav2_msgs/action/compute_path_to_pose.hpp"
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 
@@ -84,8 +86,25 @@ public:
 
   using NavigationGoalHandle =
       rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>;
+  using ComputePathGoalHandle =
+      rclcpp_action::ClientGoalHandle<nav2_msgs::action::ComputePathToPose>;
 
 private:
+  struct ReachabilityResult {
+    bool reachable = false;
+    bool definitive = false;
+    size_t path_poses = 0;
+    std::string reason = "not_checked";
+  };
+
+  struct CachedReachabilityRejection {
+    geometry_msgs::msg::Point target;
+    uint64_t map_sequence = 0;
+    rclcpp::Time inserted_at;
+    size_t path_poses = 0;
+    std::string reason;
+  };
+
   /**
    * @brief  Make a global plan
    */
@@ -131,9 +150,13 @@ private:
   Costmap2DClient costmap_client_;
   rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SharedPtr
       move_base_client_;
+  rclcpp::CallbackGroup::SharedPtr reachability_callback_group_;
+  rclcpp_action::Client<nav2_msgs::action::ComputePathToPose>::SharedPtr
+      compute_path_client_;
   frontier_exploration::FrontierSearch search_;
   rclcpp::TimerBase::SharedPtr exploring_timer_;
   rclcpp::TimerBase::SharedPtr unknown_robot_cell_retry_timer_;
+  rclcpp::TimerBase::SharedPtr stale_map_blacklist_guard_timer_;
   // rclcpp::TimerBase::SharedPtr oneshot_;
 
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr resume_subscription_;
@@ -160,18 +183,39 @@ private:
   bool enable_unknown_robot_cell_frontier_retry_;
   double unknown_robot_cell_retry_timeout_sec_;
   int unknown_robot_cell_retry_min_map_updates_;
+  bool enable_reachability_biased_top_k_;
+  int reachability_top_k_;
+  int reachability_max_candidate_checks_;
+  double reachability_precheck_timeout_sec_;
+  int reachability_min_path_poses_;
+  bool debug_reachability_selection_;
+  double reachability_rejection_cache_timeout_sec_ = 10.0;
+  bool enable_stale_map_blacklist_guard_;
+  int stale_map_blacklist_guard_min_remaining_frontiers_;
+  int stale_map_blacklist_guard_max_blacklists_per_map_update_;
+  int stale_map_blacklist_guard_min_map_updates_;
+  double stale_map_blacklist_guard_timeout_sec_;
   std::string robot_base_frame_;
   std::string goal_stamp_mode_;
   bool resuming_ = false;
   bool unknown_robot_cell_retry_active_ = false;
   uint64_t unknown_robot_cell_retry_start_sequence_ = 0;
   rclcpp::Time unknown_robot_cell_retry_start_time_;
+  bool stale_map_blacklist_guard_active_ = false;
+  uint64_t stale_map_blacklist_guard_start_sequence_ = 0;
+  rclcpp::Time stale_map_blacklist_guard_start_time_;
+  uint64_t blacklist_guard_current_sequence_ = 0;
+  int blacklist_guard_allowed_on_current_sequence_ = 0;
+  size_t last_plan_remaining_frontiers_ = 0;
+  std::vector<CachedReachabilityRejection> reachability_rejection_cache_;
 
   void logFrontierDebug(
       const frontier_exploration::FrontierSearchResult& search_result,
       size_t blacklist_filtered, size_t remaining,
       const frontier_exploration::Frontier* selected_frontier,
-      const std::string& stop_reason);
+      const std::string& stop_reason, int selected_rank = -1,
+      double selected_distance_m = std::numeric_limits<double>::quiet_NaN(),
+      size_t reachability_checked = 0, size_t reachability_rejected = 0);
   void logMinSizeRejectedFrontiers(
       const frontier_exploration::FrontierSearchResult& search_result);
   void logAllBlacklistedDetails(
@@ -194,6 +238,39 @@ private:
       const Costmap2DClient::MapUpdateMetadata& metadata) const;
   void ensureUnknownRobotCellRetryTimer();
   void clearUnknownRobotCellRetry(const std::string& reason);
+  bool shouldDeferBlacklist(const geometry_msgs::msg::Point& target,
+                            const std::string& reason,
+                            size_t remaining_frontiers);
+  ReachabilityResult checkFrontierReachability(
+      const frontier_exploration::Frontier& frontier,
+      size_t candidate_rank);
+  void logReachabilityCheck(
+      const frontier_exploration::Frontier& frontier, size_t candidate_rank,
+      const ReachabilityResult& result);
+  void logReachabilitySelected(const frontier_exploration::Frontier& frontier,
+                               size_t selected_rank);
+  void logReachabilityCachedRejection(
+      const frontier_exploration::Frontier& frontier, size_t candidate_rank,
+      const CachedReachabilityRejection& cached_rejection);
+  void logReachabilityFallback(const std::string& reason,
+                               size_t candidate_rank = 0);
+  void logReachabilityExpand(size_t initial_k, size_t max_checks,
+                             size_t remaining);
+  void logReachabilityNoReachable(size_t checked, size_t remaining,
+                                  uint64_t map_sequence);
+  void cacheReachabilityRejection(
+      const frontier_exploration::Frontier& frontier,
+      const ReachabilityResult& result, uint64_t map_sequence);
+  bool cachedReachabilityRejection(
+      const frontier_exploration::Frontier& frontier, uint64_t map_sequence,
+      CachedReachabilityRejection& cached_rejection);
+  void pruneReachabilityRejectionCache(uint64_t map_sequence);
+  double distanceFromRobot(const geometry_msgs::msg::Point& point);
+  void recordBlacklistAllowedForCurrentMap();
+  bool staleMapBlacklistGuardReady(
+      const Costmap2DClient::MapUpdateMetadata& metadata) const;
+  void ensureStaleMapBlacklistGuardTimer();
+  void clearStaleMapBlacklistGuard(const std::string& reason);
   std::string formatPoint(const geometry_msgs::msg::Point& point) const;
 };
 }  // namespace explore

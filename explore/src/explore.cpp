@@ -39,10 +39,14 @@
 #include <explore/explore.h>
 
 #include <algorithm>
+#include <chrono>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <sstream>
 #include <thread>
+
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 
 inline static bool same_point(const geometry_msgs::msg::Point& one,
                               const geometry_msgs::msg::Point& two)
@@ -77,6 +81,12 @@ inline static bool is_unknown_robot_cell_terminal_reason(
       stop_reason == "all_blacklisted";
 }
 
+inline static bool is_stale_map_guarded_blacklist_reason(
+    const std::string& reason)
+{
+  return reason == "progress_timeout" || reason == "nav2_aborted";
+}
+
 namespace explore
 {
 Explore::Explore()
@@ -105,6 +115,19 @@ Explore::Explore()
                                 false);
   this->declare_parameter<double>("unknown_robot_cell_retry_timeout_sec", 8.0);
   this->declare_parameter<int>("unknown_robot_cell_retry_min_map_updates", 1);
+  this->declare_parameter<bool>("enable_reachability_biased_top_k", false);
+  this->declare_parameter<int>("reachability_top_k", 1);
+  this->declare_parameter<int>("reachability_max_candidate_checks", 5);
+  this->declare_parameter<double>("reachability_precheck_timeout_sec", 2.0);
+  this->declare_parameter<int>("reachability_min_path_poses", 1);
+  this->declare_parameter<bool>("debug_reachability_selection", false);
+  this->declare_parameter<bool>("enable_stale_map_blacklist_guard", false);
+  this->declare_parameter<int>(
+      "stale_map_blacklist_guard_min_remaining_frontiers", 5);
+  this->declare_parameter<int>(
+      "stale_map_blacklist_guard_max_blacklists_per_map_update", 2);
+  this->declare_parameter<int>("stale_map_blacklist_guard_min_map_updates", 1);
+  this->declare_parameter<double>("stale_map_blacklist_guard_timeout_sec", 8.0);
 
   this->get_parameter("planner_frequency", planner_frequency_);
   this->get_parameter("progress_timeout", timeout);
@@ -124,6 +147,28 @@ Explore::Explore()
                       unknown_robot_cell_retry_timeout_sec_);
   this->get_parameter("unknown_robot_cell_retry_min_map_updates",
                       unknown_robot_cell_retry_min_map_updates_);
+  this->get_parameter("enable_reachability_biased_top_k",
+                      enable_reachability_biased_top_k_);
+  this->get_parameter("reachability_top_k", reachability_top_k_);
+  this->get_parameter("reachability_max_candidate_checks",
+                      reachability_max_candidate_checks_);
+  this->get_parameter("reachability_precheck_timeout_sec",
+                      reachability_precheck_timeout_sec_);
+  this->get_parameter("reachability_min_path_poses",
+                      reachability_min_path_poses_);
+  this->get_parameter("debug_reachability_selection",
+                      debug_reachability_selection_);
+  this->get_parameter("enable_stale_map_blacklist_guard",
+                      enable_stale_map_blacklist_guard_);
+  this->get_parameter("stale_map_blacklist_guard_min_remaining_frontiers",
+                      stale_map_blacklist_guard_min_remaining_frontiers_);
+  this->get_parameter(
+      "stale_map_blacklist_guard_max_blacklists_per_map_update",
+      stale_map_blacklist_guard_max_blacklists_per_map_update_);
+  this->get_parameter("stale_map_blacklist_guard_min_map_updates",
+                      stale_map_blacklist_guard_min_map_updates_);
+  this->get_parameter("stale_map_blacklist_guard_timeout_sec",
+                      stale_map_blacklist_guard_timeout_sec_);
 
   progress_timeout_ = timeout;
   min_frontier_size_ = min_frontier_size;
@@ -131,9 +176,28 @@ Explore::Explore()
       std::max(0.0, unknown_robot_cell_retry_timeout_sec_);
   unknown_robot_cell_retry_min_map_updates_ =
       std::max(1, unknown_robot_cell_retry_min_map_updates_);
+  reachability_top_k_ = std::max(1, reachability_top_k_);
+  reachability_max_candidate_checks_ =
+      std::max(reachability_top_k_, reachability_max_candidate_checks_);
+  reachability_precheck_timeout_sec_ =
+      std::max(0.1, reachability_precheck_timeout_sec_);
+  reachability_min_path_poses_ = std::max(1, reachability_min_path_poses_);
+  stale_map_blacklist_guard_min_remaining_frontiers_ =
+      std::max(1, stale_map_blacklist_guard_min_remaining_frontiers_);
+  stale_map_blacklist_guard_max_blacklists_per_map_update_ =
+      std::max(0, stale_map_blacklist_guard_max_blacklists_per_map_update_);
+  stale_map_blacklist_guard_min_map_updates_ =
+      std::max(1, stale_map_blacklist_guard_min_map_updates_);
+  stale_map_blacklist_guard_timeout_sec_ =
+      std::max(0.0, stale_map_blacklist_guard_timeout_sec_);
   move_base_client_ =
       rclcpp_action::create_client<nav2_msgs::action::NavigateToPose>(
           this, ACTION_NAME);
+  reachability_callback_group_ =
+      this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+  compute_path_client_ =
+      rclcpp_action::create_client<nav2_msgs::action::ComputePathToPose>(
+          this, "/compute_path_to_pose", reachability_callback_group_);
 
   search_ = frontier_exploration::FrontierSearch(costmap_client_.getCostmap(),
                                                  potential_scale_, gain_scale_,
@@ -438,6 +502,7 @@ void Explore::makePlan()
                });
   const size_t blacklist_filtered = blacklisted_frontiers.size();
   const size_t remaining = frontiers.size() - blacklist_filtered;
+  last_plan_remaining_frontiers_ = remaining;
   if (frontier == frontiers.end()) {
     if (debug_frontier_search_) {
       logFrontierDebug(search_result, blacklist_filtered, remaining, nullptr,
@@ -458,9 +523,105 @@ void Explore::makePlan()
     stop(true);
     return;
   }
+
+  size_t selected_rank =
+      static_cast<size_t>(std::distance(frontiers.begin(), frontier)) + 1;
+  size_t reachability_checked = 0;
+  size_t reachability_rejected = 0;
+  if (enable_reachability_biased_top_k_) {
+    const auto metadata = costmap_client_.getMapUpdateMetadata();
+    pruneReachabilityRejectionCache(metadata.sequence);
+
+    const size_t initial_k = static_cast<size_t>(reachability_top_k_);
+    const size_t max_candidate_checks =
+        static_cast<size_t>(reachability_max_candidate_checks_);
+    std::vector<size_t> candidate_indices;
+    candidate_indices.reserve(max_candidate_checks);
+    for (size_t index = 0; index < frontiers.size(); ++index) {
+      if (goalOnBlacklist(frontiers[index].centroid)) {
+        continue;
+      }
+      candidate_indices.push_back(index);
+      if (candidate_indices.size() >= max_candidate_checks) {
+        break;
+      }
+    }
+
+    bool selected_frontier = false;
+    bool expanded_beyond_initial_window = false;
+    for (size_t candidate_order = 0; candidate_order < candidate_indices.size();
+         ++candidate_order) {
+      if (candidate_order == initial_k) {
+        expanded_beyond_initial_window = true;
+        logReachabilityExpand(initial_k, max_candidate_checks, remaining);
+      }
+
+      const size_t candidate_index = candidate_indices[candidate_order];
+      auto candidate = frontiers.begin() + static_cast<std::ptrdiff_t>(candidate_index);
+      const size_t candidate_rank = candidate_order + 1;
+
+      CachedReachabilityRejection cached_rejection;
+      if (cachedReachabilityRejection(*candidate, metadata.sequence,
+                                      cached_rejection)) {
+        ++reachability_rejected;
+        logReachabilityCachedRejection(*candidate, candidate_rank,
+                                       cached_rejection);
+        continue;
+      }
+
+      ++reachability_checked;
+      ReachabilityResult reachability =
+          checkFrontierReachability(*candidate, candidate_rank);
+      logReachabilityCheck(*candidate, candidate_rank, reachability);
+      if (reachability.reachable) {
+        frontier = candidate;
+        selected_rank = candidate_rank;
+        selected_frontier = true;
+        logReachabilitySelected(*candidate, candidate_rank);
+        break;
+      }
+
+      if (reachability.definitive) {
+        ++reachability_rejected;
+        cacheReachabilityRejection(*candidate, reachability,
+                                   metadata.sequence);
+        continue;
+      }
+
+      frontier = candidate;
+      selected_rank = candidate_rank;
+      selected_frontier = true;
+      logReachabilityFallback(reachability.reason, candidate_rank);
+      break;
+    }
+
+    if (!selected_frontier) {
+      if (reachability_rejected > 0 || expanded_beyond_initial_window) {
+        logReachabilityNoReachable(candidate_indices.size(), remaining,
+                                   metadata.sequence);
+        if (debug_frontier_search_) {
+          logFrontierDebug(search_result, blacklist_filtered, remaining,
+                           nullptr, "top_k_no_reachable_candidate", -1,
+                           std::numeric_limits<double>::quiet_NaN(),
+                           reachability_checked, reachability_rejected);
+        }
+        if (publish_debug_frontiers_) {
+          visualizeDebugFrontiers(search_result, blacklisted_frontiers,
+                                  nullptr);
+        }
+        return;
+      }
+
+      logReachabilityFallback("no_top_k_candidates");
+    }
+  }
+
   if (debug_frontier_search_) {
     logFrontierDebug(search_result, blacklist_filtered, remaining, &(*frontier),
-                     "remaining_frontiers_available");
+                     "remaining_frontiers_available",
+                     static_cast<int>(selected_rank),
+                     distanceFromRobot(frontier->centroid),
+                     reachability_checked, reachability_rejected);
   }
   if (publish_debug_frontiers_) {
     visualizeDebugFrontiers(search_result, blacklisted_frontiers, &(*frontier));
@@ -480,8 +641,13 @@ void Explore::makePlan()
   // black list if we've made no progress for a long time
   if ((this->now() - last_progress_ >
       tf2::durationFromSec(progress_timeout_)) && !resuming_) {
+    if (shouldDeferBlacklist(target_position, "progress_timeout",
+                             remaining)) {
+      return;
+    }
     frontier_blacklist_.push_back(target_position);
     logBlacklistAdded(target_position, "progress_timeout");
+    recordBlacklistAllowedForCurrentMap();
     RCLCPP_DEBUG(logger_, "Adding current goal to black list");
     makePlan();
     return;
@@ -692,6 +858,425 @@ void Explore::clearUnknownRobotCellRetry(const std::string& reason)
   }
 }
 
+Explore::ReachabilityResult Explore::checkFrontierReachability(
+    const frontier_exploration::Frontier& frontier, size_t candidate_rank)
+{
+  (void)candidate_rank;
+  ReachabilityResult result;
+
+  if (!compute_path_client_ || !compute_path_client_->action_server_is_ready()) {
+    result.reason = "server_unavailable";
+    return result;
+  }
+
+  auto remaining_timeout = [deadline =
+                               std::chrono::steady_clock::now() +
+                               std::chrono::duration_cast<
+                                   std::chrono::steady_clock::duration>(
+                                   std::chrono::duration<double>(
+                                       reachability_precheck_timeout_sec_))]() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return std::chrono::steady_clock::duration::zero();
+    }
+    return deadline - now;
+  };
+
+  auto goal = nav2_msgs::action::ComputePathToPose::Goal();
+  goal.goal.pose.position = frontier.centroid;
+  goal.goal.pose.orientation.w = 1.0;
+  goal.goal.header.frame_id = costmap_client_.getGlobalFrameID();
+  if (goal_stamp_mode_ == "latest") {
+    goal.goal.header.stamp =
+        rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
+  } else {
+    goal.goal.header.stamp = this->now();
+  }
+  goal.planner_id = "";
+  goal.use_start = false;
+
+  auto send_goal_future = compute_path_client_->async_send_goal(goal);
+  if (send_goal_future.wait_for(remaining_timeout()) !=
+      std::future_status::ready) {
+    result.reason = "timeout";
+    return result;
+  }
+
+  auto goal_handle = send_goal_future.get();
+  if (!goal_handle) {
+    result.reason = "rejected";
+    result.definitive = true;
+    return result;
+  }
+
+  auto result_future = compute_path_client_->async_get_result(goal_handle);
+  if (result_future.wait_for(remaining_timeout()) !=
+      std::future_status::ready) {
+    compute_path_client_->async_cancel_goal(goal_handle);
+    result.reason = "timeout";
+    return result;
+  }
+
+  auto wrapped_result = result_future.get();
+  if (!wrapped_result.result) {
+    result.reason = "no_valid_path";
+    result.definitive = true;
+    return result;
+  }
+
+  result.path_poses = wrapped_result.result->path.poses.size();
+  if (wrapped_result.code == rclcpp_action::ResultCode::SUCCEEDED &&
+      wrapped_result.result->error_code ==
+          nav2_msgs::action::ComputePathToPose::Result::NONE &&
+      result.path_poses >= static_cast<size_t>(reachability_min_path_poses_)) {
+    result.reason = "ok";
+    result.reachable = true;
+    result.definitive = true;
+    return result;
+  }
+
+  result.reason = "no_valid_path";
+  result.definitive = true;
+  return result;
+}
+
+void Explore::logReachabilityCheck(
+    const frontier_exploration::Frontier& frontier, size_t candidate_rank,
+    const ReachabilityResult& result)
+{
+  RCLCPP_INFO(
+      logger_,
+      "explore_reachability_top_k candidate_rank=%lu target=%s "
+      "distance_m=%.3f cost=%.6f path_poses=%lu reachable=%s reason=%s",
+      candidate_rank, formatPoint(frontier.centroid).c_str(),
+      distanceFromRobot(frontier.centroid), frontier.cost, result.path_poses,
+      result.reachable ? "true" : "false", result.reason.c_str());
+}
+
+void Explore::logReachabilitySelected(
+    const frontier_exploration::Frontier& frontier, size_t selected_rank)
+{
+  RCLCPP_INFO(
+      logger_,
+      "explore_reachability_top_k_selected selected_rank=%lu target=%s "
+      "distance_m=%.3f cost=%.6f",
+      selected_rank, formatPoint(frontier.centroid).c_str(),
+      distanceFromRobot(frontier.centroid), frontier.cost);
+}
+
+void Explore::logReachabilityCachedRejection(
+    const frontier_exploration::Frontier& frontier, size_t candidate_rank,
+    const CachedReachabilityRejection& cached_rejection)
+{
+  const double age_sec = (this->now() - cached_rejection.inserted_at).seconds();
+  RCLCPP_INFO(
+      logger_,
+      "explore_reachability_top_k_rejected_cached candidate_rank=%lu "
+      "target=%s distance_m=%.3f cost=%.6f path_poses=%lu "
+      "reason=%s map_sequence=%llu age_sec=%.3f",
+      candidate_rank, formatPoint(frontier.centroid).c_str(),
+      distanceFromRobot(frontier.centroid), frontier.cost,
+      cached_rejection.path_poses, cached_rejection.reason.c_str(),
+      static_cast<unsigned long long>(cached_rejection.map_sequence),
+      age_sec);
+}
+
+void Explore::logReachabilityFallback(const std::string& reason,
+                                      size_t candidate_rank)
+{
+  RCLCPP_INFO(
+      logger_,
+      "explore_reachability_top_k_fallback reason=%s candidate_rank=%lu",
+      reason.c_str(), candidate_rank);
+}
+
+void Explore::logReachabilityExpand(size_t initial_k, size_t max_checks,
+                                    size_t remaining)
+{
+  RCLCPP_INFO(
+      logger_,
+      "explore_reachability_top_k_expand initial_k=%lu max_checks=%lu "
+      "remaining=%lu",
+      initial_k, max_checks, remaining);
+}
+
+void Explore::logReachabilityNoReachable(size_t checked, size_t remaining,
+                                         uint64_t map_sequence)
+{
+  RCLCPP_INFO(
+      logger_,
+      "explore_reachability_top_k_no_reachable checked=%lu remaining=%lu "
+      "map_sequence=%llu",
+      checked, remaining, static_cast<unsigned long long>(map_sequence));
+}
+
+void Explore::cacheReachabilityRejection(
+    const frontier_exploration::Frontier& frontier,
+    const ReachabilityResult& result, uint64_t map_sequence)
+{
+  if (!result.definitive || result.reachable) {
+    return;
+  }
+
+  CachedReachabilityRejection cached_rejection;
+  cached_rejection.target = frontier.centroid;
+  cached_rejection.map_sequence = map_sequence;
+  cached_rejection.inserted_at = this->now();
+  cached_rejection.path_poses = result.path_poses;
+  cached_rejection.reason = result.reason;
+  reachability_rejection_cache_.push_back(cached_rejection);
+}
+
+bool Explore::cachedReachabilityRejection(
+    const frontier_exploration::Frontier& frontier, uint64_t map_sequence,
+    CachedReachabilityRejection& cached_rejection)
+{
+  for (const auto& entry : reachability_rejection_cache_) {
+    if (entry.map_sequence != map_sequence) {
+      continue;
+    }
+    const double age_sec = (this->now() - entry.inserted_at).seconds();
+    if (age_sec > reachability_rejection_cache_timeout_sec_) {
+      continue;
+    }
+    if (same_point(entry.target, frontier.centroid)) {
+      cached_rejection = entry;
+      return true;
+    }
+  }
+  return false;
+}
+
+void Explore::pruneReachabilityRejectionCache(uint64_t map_sequence)
+{
+  const auto now = this->now();
+  reachability_rejection_cache_.erase(
+      std::remove_if(
+          reachability_rejection_cache_.begin(),
+          reachability_rejection_cache_.end(),
+          [this, map_sequence, now](const CachedReachabilityRejection& entry) {
+            if (entry.map_sequence != map_sequence) {
+              return true;
+            }
+            return (now - entry.inserted_at).seconds() >
+                reachability_rejection_cache_timeout_sec_;
+          }),
+      reachability_rejection_cache_.end());
+}
+
+double Explore::distanceFromRobot(const geometry_msgs::msg::Point& point)
+{
+  const auto pose = costmap_client_.getRobotPose();
+  const double dx = point.x - pose.position.x;
+  const double dy = point.y - pose.position.y;
+  return std::sqrt(dx * dx + dy * dy);
+}
+
+bool Explore::shouldDeferBlacklist(const geometry_msgs::msg::Point& target,
+                                   const std::string& reason,
+                                   size_t remaining_frontiers)
+{
+  if (!enable_stale_map_blacklist_guard_ ||
+      !is_stale_map_guarded_blacklist_reason(reason)) {
+    return false;
+  }
+
+  if (remaining_frontiers <
+      static_cast<size_t>(
+          stale_map_blacklist_guard_min_remaining_frontiers_)) {
+    return false;
+  }
+
+  const auto metadata = costmap_client_.getMapUpdateMetadata();
+  if (stale_map_blacklist_guard_active_) {
+    if (staleMapBlacklistGuardReady(metadata)) {
+      const uint64_t map_updates =
+          metadata.sequence > stale_map_blacklist_guard_start_sequence_ ?
+          metadata.sequence - stale_map_blacklist_guard_start_sequence_ : 0;
+      const char* ready_reason =
+          map_updates >=
+              static_cast<uint64_t>(
+                  stale_map_blacklist_guard_min_map_updates_) ?
+          "map_update" : "timeout";
+      RCLCPP_INFO(
+          logger_,
+          "explore_stale_map_blacklist_guard_ready reason=%s "
+          "start_sequence=%llu current_sequence=%llu map_updates=%llu "
+          "elapsed_sec=%.3f timeout_sec=%.3f map_update_source=%s",
+          ready_reason,
+          static_cast<unsigned long long>(
+              stale_map_blacklist_guard_start_sequence_),
+          static_cast<unsigned long long>(metadata.sequence),
+          static_cast<unsigned long long>(map_updates),
+          (this->now() - stale_map_blacklist_guard_start_time_).seconds(),
+          stale_map_blacklist_guard_timeout_sec_,
+          metadata.update_source.c_str());
+      clearStaleMapBlacklistGuard(ready_reason);
+      return false;
+    }
+
+    ensureStaleMapBlacklistGuardTimer();
+    RCLCPP_INFO_THROTTLE(
+        logger_, *this->get_clock(), 2000,
+        "explore_frontier_blacklist_deferred reason=stale_map_guard "
+        "original_reason=%s target=%s remaining_frontiers=%lu "
+        "blacklist_size=%lu current_sequence=%llu allowed_on_sequence=%d "
+        "max_allowed_on_sequence=%d",
+        reason.c_str(), formatPoint(target).c_str(), remaining_frontiers,
+        frontier_blacklist_.size(),
+        static_cast<unsigned long long>(metadata.sequence),
+        blacklist_guard_allowed_on_current_sequence_,
+        stale_map_blacklist_guard_max_blacklists_per_map_update_);
+    return true;
+  }
+
+  if (metadata.sequence != blacklist_guard_current_sequence_) {
+    blacklist_guard_current_sequence_ = metadata.sequence;
+    blacklist_guard_allowed_on_current_sequence_ = 0;
+    return false;
+  }
+
+  if (blacklist_guard_allowed_on_current_sequence_ <
+      stale_map_blacklist_guard_max_blacklists_per_map_update_) {
+    return false;
+  }
+
+  stale_map_blacklist_guard_active_ = true;
+  stale_map_blacklist_guard_start_sequence_ = metadata.sequence;
+  stale_map_blacklist_guard_start_time_ = this->now();
+  ensureStaleMapBlacklistGuardTimer();
+  RCLCPP_INFO(
+      logger_,
+      "explore_stale_map_blacklist_guard_started original_reason=%s "
+      "target=%s start_sequence=%llu required_map_updates=%d "
+      "timeout_sec=%.3f map_update_source=%s",
+      reason.c_str(), formatPoint(target).c_str(),
+      static_cast<unsigned long long>(stale_map_blacklist_guard_start_sequence_),
+      stale_map_blacklist_guard_min_map_updates_,
+      stale_map_blacklist_guard_timeout_sec_, metadata.update_source.c_str());
+  RCLCPP_INFO_THROTTLE(
+      logger_, *this->get_clock(), 2000,
+      "explore_frontier_blacklist_deferred reason=stale_map_guard "
+      "original_reason=%s target=%s remaining_frontiers=%lu "
+      "blacklist_size=%lu current_sequence=%llu allowed_on_sequence=%d "
+      "max_allowed_on_sequence=%d",
+      reason.c_str(), formatPoint(target).c_str(), remaining_frontiers,
+      frontier_blacklist_.size(),
+      static_cast<unsigned long long>(metadata.sequence),
+      blacklist_guard_allowed_on_current_sequence_,
+      stale_map_blacklist_guard_max_blacklists_per_map_update_);
+  return true;
+}
+
+void Explore::recordBlacklistAllowedForCurrentMap()
+{
+  if (!enable_stale_map_blacklist_guard_) {
+    return;
+  }
+
+  const auto metadata = costmap_client_.getMapUpdateMetadata();
+  if (metadata.sequence != blacklist_guard_current_sequence_) {
+    blacklist_guard_current_sequence_ = metadata.sequence;
+    blacklist_guard_allowed_on_current_sequence_ = 0;
+  }
+  ++blacklist_guard_allowed_on_current_sequence_;
+}
+
+bool Explore::staleMapBlacklistGuardReady(
+    const Costmap2DClient::MapUpdateMetadata& metadata) const
+{
+  if (!stale_map_blacklist_guard_active_) {
+    return false;
+  }
+
+  const uint64_t map_updates =
+      metadata.sequence > stale_map_blacklist_guard_start_sequence_ ?
+      metadata.sequence - stale_map_blacklist_guard_start_sequence_ : 0;
+  if (map_updates >=
+      static_cast<uint64_t>(stale_map_blacklist_guard_min_map_updates_)) {
+    return true;
+  }
+
+  return (this->now() - stale_map_blacklist_guard_start_time_).seconds() >=
+      stale_map_blacklist_guard_timeout_sec_;
+}
+
+void Explore::ensureStaleMapBlacklistGuardTimer()
+{
+  if (stale_map_blacklist_guard_timer_ &&
+      !stale_map_blacklist_guard_timer_->is_canceled()) {
+    return;
+  }
+
+  stale_map_blacklist_guard_timer_ = this->create_wall_timer(
+      std::chrono::milliseconds(250), [this]() {
+        if (!stale_map_blacklist_guard_active_) {
+          if (stale_map_blacklist_guard_timer_) {
+            stale_map_blacklist_guard_timer_->cancel();
+          }
+          return;
+        }
+
+        const auto metadata = costmap_client_.getMapUpdateMetadata();
+        if (!staleMapBlacklistGuardReady(metadata)) {
+          return;
+        }
+
+        const uint64_t map_updates =
+            metadata.sequence > stale_map_blacklist_guard_start_sequence_ ?
+            metadata.sequence - stale_map_blacklist_guard_start_sequence_ : 0;
+        const char* ready_reason =
+            map_updates >=
+                static_cast<uint64_t>(
+                    stale_map_blacklist_guard_min_map_updates_) ?
+            "map_update" : "timeout";
+        RCLCPP_INFO(
+            logger_,
+            "explore_stale_map_blacklist_guard_ready reason=%s "
+            "start_sequence=%llu current_sequence=%llu map_updates=%llu "
+            "elapsed_sec=%.3f timeout_sec=%.3f map_update_source=%s",
+            ready_reason,
+            static_cast<unsigned long long>(
+                stale_map_blacklist_guard_start_sequence_),
+            static_cast<unsigned long long>(metadata.sequence),
+            static_cast<unsigned long long>(map_updates),
+            (this->now() - stale_map_blacklist_guard_start_time_).seconds(),
+            stale_map_blacklist_guard_timeout_sec_,
+            metadata.update_source.c_str());
+        clearStaleMapBlacklistGuard(ready_reason);
+        makePlan();
+      });
+}
+
+void Explore::clearStaleMapBlacklistGuard(const std::string& reason)
+{
+  if (!stale_map_blacklist_guard_active_) {
+    return;
+  }
+
+  const auto metadata = costmap_client_.getMapUpdateMetadata();
+  const uint64_t map_updates =
+      metadata.sequence > stale_map_blacklist_guard_start_sequence_ ?
+      metadata.sequence - stale_map_blacklist_guard_start_sequence_ : 0;
+  RCLCPP_INFO(
+      logger_,
+      "explore_stale_map_blacklist_guard_cleared reason=%s "
+      "start_sequence=%llu current_sequence=%llu map_updates=%llu "
+      "elapsed_sec=%.3f map_update_source=%s",
+      reason.c_str(),
+      static_cast<unsigned long long>(stale_map_blacklist_guard_start_sequence_),
+      static_cast<unsigned long long>(metadata.sequence),
+      static_cast<unsigned long long>(map_updates),
+      (this->now() - stale_map_blacklist_guard_start_time_).seconds(),
+      metadata.update_source.c_str());
+
+  stale_map_blacklist_guard_active_ = false;
+  stale_map_blacklist_guard_start_sequence_ = 0;
+  if (stale_map_blacklist_guard_timer_) {
+    stale_map_blacklist_guard_timer_->cancel();
+  }
+}
+
 void Explore::returnToInitialPose()
 {
   RCLCPP_INFO(logger_, "Returning to initial pose.");
@@ -736,7 +1321,9 @@ void Explore::logFrontierDebug(
     const frontier_exploration::FrontierSearchResult& search_result,
     size_t blacklist_filtered, size_t remaining,
     const frontier_exploration::Frontier* selected_frontier,
-    const std::string& stop_reason)
+    const std::string& stop_reason, int selected_rank,
+    double selected_distance_m, size_t reachability_checked,
+    size_t reachability_rejected)
 {
   std::string selected = selected_frontier == nullptr ?
       "none" : formatPoint(selected_frontier->centroid);
@@ -754,13 +1341,18 @@ void Explore::logFrontierDebug(
       "explore_frontier_debug raw_frontiers=%lu min_size_filtered=%lu "
       "sorted_frontiers=%lu blacklist_filtered=%lu remaining=%lu "
       "blacklist_size=%lu selected=%s stop_reason=%s resolution=%.3f "
-      "width=%u height=%u robot_cell=%s robot_occupancy=%s",
+      "width=%u height=%u robot_cell=%s robot_occupancy=%s "
+      "selected_rank=%d selected_distance_m=%.3f reachability_enabled=%s "
+      "reachability_checked=%lu reachability_rejected=%lu",
       search_result.raw_frontiers.size(),
       search_result.min_size_rejected_frontiers.size(),
       search_result.filtered_frontiers.size(), blacklist_filtered, remaining,
       frontier_blacklist_.size(), selected.c_str(), stop_reason.c_str(),
       search_result.resolution, search_result.width, search_result.height,
-      robot_cell.c_str(), robot_occupancy.c_str());
+      robot_cell.c_str(), robot_occupancy.c_str(), selected_rank,
+      selected_distance_m,
+      enable_reachability_biased_top_k_ ? "true" : "false",
+      reachability_checked, reachability_rejected);
 }
 
 void Explore::logMinSizeRejectedFrontiers(
@@ -896,8 +1488,16 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
                     nav2_error_msg.c_str());
         return;
       }
+      if (shouldDeferBlacklist(frontier_goal, "nav2_aborted",
+                               last_plan_remaining_frontiers_)) {
+        prev_goal_.x = std::numeric_limits<double>::quiet_NaN();
+        prev_goal_.y = std::numeric_limits<double>::quiet_NaN();
+        prev_goal_.z = std::numeric_limits<double>::quiet_NaN();
+        return;
+      }
       frontier_blacklist_.push_back(frontier_goal);
       logBlacklistAdded(frontier_goal, "nav2_aborted");
+      recordBlacklistAllowedForCurrentMap();
       RCLCPP_DEBUG(logger_, "Adding current goal to black list");
       // If it was aborted probably because we've found another frontier goal,
       // so just return and don't make plan again
@@ -945,6 +1545,7 @@ void Explore::stop(bool finished_exploring)
   move_base_client_->async_cancel_all_goals();
   exploring_timer_->cancel();
   clearUnknownRobotCellRetry("exploration_stopped");
+  clearStaleMapBlacklistGuard("exploration_stopped");
 
   if (return_to_init_ && finished_exploring) {
     returnToInitialPose();
@@ -975,8 +1576,11 @@ int main(int argc, char** argv)
                                      ros::console::levels::Debug)) {
     ros::console::notifyLoggerLevelsChanged();
   } */
-  rclcpp::spin(
-      std::make_shared<explore::Explore>());  // std::move(std::make_unique)?
+  auto node = std::make_shared<explore::Explore>();
+  rclcpp::executors::MultiThreadedExecutor executor(
+      rclcpp::ExecutorOptions(), 2);
+  executor.add_node(node);
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }
