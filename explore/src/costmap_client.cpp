@@ -62,11 +62,14 @@ Costmap2DClient::Costmap2DClient(rclcpp::Node& node, const tf2_ros::Buffer* tf)
                                                                        "link"));
   // transform tolerance is used for all tf transforms here
   node_.declare_parameter<double>("transform_tolerance", 0.3);
+  node_.declare_parameter<std::string>("robot_pose_stamp_mode",
+                                       std::string("now"));
 
   node_.get_parameter("costmap_topic", costmap_topic);
   node_.get_parameter("costmap_updates_topic", costmap_updates_topic);
   node_.get_parameter("robot_base_frame", robot_base_frame_);
   node_.get_parameter("transform_tolerance", transform_tolerance_);
+  node_.get_parameter("robot_pose_stamp_mode", robot_pose_stamp_mode_);
 
   /* initialize costmap */
   costmap_sub_ = node_.create_subscription<nav_msgs::msg::OccupancyGrid>(
@@ -170,6 +173,7 @@ void Costmap2DClient::updateFullMap(
   }
   RCLCPP_DEBUG(node_.get_logger(), "map updated, written %lu values",
                costmap_size);
+  updateMapMetadata(msg->header.stamp, "full");
 }
 
 void Costmap2DClient::updatePartialMap(
@@ -217,6 +221,7 @@ void Costmap2DClient::updatePartialMap(
       ++i;
     }
   }
+  updateMapMetadata(msg->header.stamp, "partial");
 }
 
 geometry_msgs::msg::Pose Costmap2DClient::getRobotPose() const
@@ -224,7 +229,12 @@ geometry_msgs::msg::Pose Costmap2DClient::getRobotPose() const
   geometry_msgs::msg::PoseStamped robot_pose;
   geometry_msgs::msg::Pose empty_pose;
   robot_pose.header.frame_id = robot_base_frame_;
-  robot_pose.header.stamp = node_.now();
+  if (robot_pose_stamp_mode_ == "latest") {
+    robot_pose.header.stamp =
+        rclcpp::Time(0, 0, node_.get_clock()->get_clock_type());
+  } else {
+    robot_pose.header.stamp = node_.now();
+  }
 
   auto& clk = *node_.get_clock();
 
@@ -255,6 +265,28 @@ geometry_msgs::msg::Pose Costmap2DClient::getRobotPose() const
   }
 
   return robot_pose.pose;
+}
+
+Costmap2DClient::MapUpdateMetadata
+Costmap2DClient::getMapUpdateMetadata() const
+{
+  std::lock_guard<std::mutex> lock(map_metadata_mutex_);
+  return map_metadata_;
+}
+
+void Costmap2DClient::updateMapMetadata(
+    const builtin_interfaces::msg::Time& header_stamp,
+    const std::string& update_source)
+{
+  std::lock_guard<std::mutex> lock(map_metadata_mutex_);
+  ++map_metadata_.sequence;
+  map_metadata_.last_header_stamp = header_stamp;
+  const int64_t receive_time_ns = node_.now().nanoseconds();
+  map_metadata_.last_receive_time.sec =
+      static_cast<int32_t>(receive_time_ns / 1000000000LL);
+  map_metadata_.last_receive_time.nanosec =
+      static_cast<uint32_t>(receive_time_ns % 1000000000LL);
+  map_metadata_.update_source = update_source;
 }
 
 std::array<unsigned char, 256> init_translation_table()

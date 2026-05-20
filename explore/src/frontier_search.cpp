@@ -26,13 +26,31 @@ FrontierSearch::FrontierSearch(nav2_costmap_2d::Costmap2D* costmap,
 std::vector<Frontier>
 FrontierSearch::searchFrom(geometry_msgs::msg::Point position)
 {
-  std::vector<Frontier> frontier_list;
+  return searchFromWithDiagnostics(position).filtered_frontiers;
+}
+
+FrontierSearchResult
+FrontierSearch::searchFromWithDiagnostics(geometry_msgs::msg::Point position)
+{
+  FrontierSearchResult result;
+  if (costmap_ == nullptr || costmap_->getCharMap() == nullptr ||
+      costmap_->getSizeInCellsX() == 0 || costmap_->getSizeInCellsY() == 0 ||
+      costmap_->getResolution() <= 0.0) {
+    result.valid = false;
+    result.invalid_reason = "map_unavailable_or_invalid";
+    return result;
+  }
+  result.resolution = costmap_->getResolution();
+  result.width = costmap_->getSizeInCellsX();
+  result.height = costmap_->getSizeInCellsY();
 
   // Sanity check that robot is inside costmap bounds before searching
   unsigned int mx, my;
   if (!costmap_->worldToMap(position.x, position.y, mx, my)) {
     RCLCPP_ERROR(logger_, "[FrontierSearch] Robot out of costmap bounds, cannot search for frontiers");
-    return frontier_list;
+    result.valid = false;
+    result.invalid_reason = "robot_out_of_costmap_bounds";
+    return result;
   }
 
   // make sure map is consistent and locked for duration of search
@@ -42,6 +60,18 @@ FrontierSearch::searchFrom(geometry_msgs::msg::Point position)
   map_ = costmap_->getCharMap();
   size_x_ = costmap_->getSizeInCellsX();
   size_y_ = costmap_->getSizeInCellsY();
+  result.width = size_x_;
+  result.height = size_y_;
+  result.robot_cell_valid = true;
+  result.robot_mx = mx;
+  result.robot_my = my;
+  unsigned int robot_index = costmap_->getIndex(mx, my);
+  result.robot_occupancy = static_cast<int>(map_[robot_index]);
+  for (unsigned int idx = 0; idx < size_x_ * size_y_; ++idx) {
+    if (map_[idx] == NO_INFORMATION) {
+      ++result.unknown_cell_count;
+    }
+  }
 
   // initialize flag arrays to keep track of visited and frontier cells
   std::vector<bool> frontier_flag(size_x_ * size_y_, false);
@@ -51,7 +81,7 @@ FrontierSearch::searchFrom(geometry_msgs::msg::Point position)
   std::queue<unsigned int> bfs;
 
   // find closest clear cell to start search
-  unsigned int clear, pos = costmap_->getIndex(mx, my);
+  unsigned int clear, pos = robot_index;
   if (nearestCell(clear, pos, FREE_SPACE, *costmap_)) {
     bfs.push(clear);
   } else {
@@ -76,23 +106,27 @@ FrontierSearch::searchFrom(geometry_msgs::msg::Point position)
       } else if (isNewFrontierCell(nbr, frontier_flag)) {
         frontier_flag[nbr] = true;
         Frontier new_frontier = buildNewFrontier(nbr, pos, frontier_flag);
+        new_frontier.cost = frontierCost(new_frontier);
+        result.raw_frontiers.push_back(new_frontier);
         if (new_frontier.size * costmap_->getResolution() >=
             min_frontier_size_) {
-          frontier_list.push_back(new_frontier);
+          result.filtered_frontiers.push_back(new_frontier);
+        } else {
+          result.min_size_rejected_frontiers.push_back(new_frontier);
         }
       }
     }
   }
 
   // set costs of frontiers
-  for (auto& frontier : frontier_list) {
+  for (auto& frontier : result.filtered_frontiers) {
     frontier.cost = frontierCost(frontier);
   }
   std::sort(
-      frontier_list.begin(), frontier_list.end(),
+      result.filtered_frontiers.begin(), result.filtered_frontiers.end(),
       [](const Frontier& f1, const Frontier& f2) { return f1.cost < f2.cost; });
 
-  return frontier_list;
+  return result;
 }
 
 Frontier FrontierSearch::buildNewFrontier(unsigned int initial_cell,
