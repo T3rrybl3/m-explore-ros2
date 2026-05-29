@@ -83,7 +83,15 @@ add_executable(explore
   src/frontier_search.cpp
 )
 
+add_executable(direct_nav2_explorer
+  src/direct_nav2_explorer.cpp
+)
+
 target_include_directories(explore PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+
+target_include_directories(direct_nav2_explorer PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 
@@ -101,7 +109,19 @@ target_link_libraries(explore PUBLIC
   tf2_ros::tf2_ros
 )
 
-install(TARGETS explore
+target_link_libraries(direct_nav2_explorer PUBLIC
+  ${explore_lite_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${nav2_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${std_msgs_TARGETS}
+  ${visualization_msgs_TARGETS}
+  rclcpp::rclcpp
+  tf2::tf2
+  tf2_ros::tf2_ros
+)
+
+install(TARGETS explore direct_nav2_explorer
   DESTINATION lib/${PROJECT_NAME})
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${GAZEBO_CXX_FLAGS}")
