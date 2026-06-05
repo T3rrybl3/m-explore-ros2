@@ -9,6 +9,7 @@
  *********************************************************************/
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -331,11 +332,16 @@ public:
         this->create_publisher<explore_lite_msgs::msg::ExploreStatus>(
             "/explore/status", status_qos);
 
+    resume_callback_group_ =
+        this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    rclcpp::SubscriptionOptions resume_options;
+    resume_options.callback_group = resume_callback_group_;
     resume_subscription_ = this->create_subscription<std_msgs::msg::Bool>(
         "/explore/resume", 10,
         [this](const std_msgs::msg::Bool::SharedPtr msg) {
           handleResume(msg->data);
-        });
+        },
+        resume_options);
 
     nav_client_ =
         rclcpp_action::create_client<NavigateToPose>(this, navigate_action_name_);
@@ -783,7 +789,8 @@ private:
 
   void onPlannerTimer()
   {
-    if (state_ == ExplorerState::PAUSED ||
+    if (pause_requested_.load() ||
+        state_ == ExplorerState::PAUSED ||
         state_ == ExplorerState::EXPLORATION_COMPLETE ||
         state_ == ExplorerState::EXPLORATION_EXHAUSTED_RESIDUAL_FRONTIERS) {
       return;
@@ -871,6 +878,12 @@ private:
     publishFrontierMarkers(selection.frontiers,
                            selection.outcome == SelectionResult::Outcome::SELECTED ?
                                &selection.selected : nullptr);
+
+    if (pause_requested_.load()) {
+      setState(ExplorerState::PAUSED, "pause_requested_after_frontier_selection");
+      publishStatusSnapshot("pause_acknowledged");
+      return;
+    }
 
     if (selection.outcome == SelectionResult::Outcome::COMPLETE) {
       RCLCPP_INFO(this->get_logger(),
@@ -2648,6 +2661,12 @@ private:
   void sendNavigationGoal(const FrontierGroup& frontier,
                           const geometry_msgs::msg::Pose& robot_pose)
   {
+    if (pause_requested_.load() || state_ == ExplorerState::PAUSED) {
+      setState(ExplorerState::PAUSED, "pause_requested_before_goal_send");
+      publishStatusSnapshot("pause_acknowledged");
+      return;
+    }
+
     if (active_goal_ &&
         distance2d(active_goal_target_, frontier.target) <
             same_goal_distance_m_) {
@@ -2787,15 +2806,18 @@ private:
   void handleResume(bool resume)
   {
     if (!resume) {
+      pause_requested_.store(true);
       if (active_goal_ && active_goal_handle_) {
         nav_client_->async_cancel_goal(active_goal_handle_);
       }
       clearActiveGoal("paused");
       setState(ExplorerState::PAUSED, "resume_false");
+      publishStatusSnapshot("pause_acknowledged");
       RCLCPP_INFO(this->get_logger(), "explore_pause_applied");
       return;
     }
 
+    pause_requested_.store(false);
     if (state_ == ExplorerState::PAUSED ||
         state_ == ExplorerState::EXPLORATION_COMPLETE ||
         state_ ==
@@ -2814,8 +2836,11 @@ private:
                     "explore_residual_exhaustion_manual_retry_reset");
       }
       setState(ExplorerState::SELECTING_FRONTIER, "resume_true");
+      publishStatusSnapshot("resume_acknowledged");
       RCLCPP_INFO(this->get_logger(), "explore_resume_applied");
+      return;
     }
+    publishStatusSnapshot("resume_true_already_active");
   }
 
   void clearActiveGoal(const std::string& reason)
@@ -3184,6 +3209,19 @@ private:
                 reason.c_str());
   }
 
+  void publishStatusSnapshot(const std::string& reason)
+  {
+    if (!state_initialized_) {
+      return;
+    }
+    explore_lite_msgs::msg::ExploreStatus status;
+    status.status = statusForState(state_);
+    status_publisher_->publish(status);
+    RCLCPP_INFO(this->get_logger(),
+                "explore_status_ack status=%s reason=%s",
+                status.status.c_str(), reason.c_str());
+  }
+
   const char* stateName(ExplorerState state) const
   {
     switch (state) {
@@ -3342,10 +3380,12 @@ private:
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
   rclcpp_action::Client<NavigateToPose>::SharedPtr nav_client_;
+  rclcpp::CallbackGroup::SharedPtr resume_callback_group_;
   rclcpp::CallbackGroup::SharedPtr compute_path_callback_group_;
   rclcpp_action::Client<ComputePathToPose>::SharedPtr compute_path_client_;
 
   ExplorerState state_ = ExplorerState::WAITING_FOR_MAP;
+  std::atomic_bool pause_requested_{false};
   bool state_initialized_ = false;
   bool start_paused_ = false;
   bool first_meaningful_map_seen_ = false;
