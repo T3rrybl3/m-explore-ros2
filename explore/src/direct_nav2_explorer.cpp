@@ -414,7 +414,14 @@ public:
         "slam_nav2_robot_tuning=unchanged",
         enable_frontier_stability_filter_ ? "enabled" : "disabled",
         enable_residual_frontier_exhaustion_ ? "enabled" : "disabled");
-    setState(ExplorerState::WAITING_FOR_MAP, "startup");
+    if (start_paused_) {
+      setState(ExplorerState::PAUSED, "startup_paused");
+      RCLCPP_INFO(
+          this->get_logger(),
+          "explore_start_paused active=true resume_topic=/explore/resume");
+    } else {
+      setState(ExplorerState::WAITING_FOR_MAP, "startup");
+    }
   }
 
 private:
@@ -436,6 +443,7 @@ private:
     declareParameterIfNeeded<std::string>(
         "navigate_action_name", "/navigate_to_pose");
     declareParameterIfNeeded<bool>("use_sim_time", true);
+    declareParameterIfNeeded<bool>("start_paused", false);
     declareParameterIfNeeded<double>("planner_frequency", 0.2);
     declareParameterIfNeeded<double>("progress_timeout", 30.0);
     declareParameterIfNeeded<bool>("visualize", true);
@@ -540,6 +548,7 @@ private:
     this->get_parameter("robot_base_frame", robot_base_frame_);
     this->get_parameter("global_frame", global_frame_);
     this->get_parameter("navigate_action_name", navigate_action_name_);
+    this->get_parameter("start_paused", start_paused_);
     this->get_parameter("planner_frequency", planner_frequency_);
     this->get_parameter("progress_timeout", progress_timeout_);
     this->get_parameter("visualize", visualize_);
@@ -3338,6 +3347,7 @@ private:
 
   ExplorerState state_ = ExplorerState::WAITING_FOR_MAP;
   bool state_initialized_ = false;
+  bool start_paused_ = false;
   bool first_meaningful_map_seen_ = false;
   rclcpp::Time first_meaningful_map_time_;
   bool nav2_wait_started_ = false;
