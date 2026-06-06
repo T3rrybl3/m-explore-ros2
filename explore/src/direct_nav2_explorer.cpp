@@ -366,6 +366,9 @@ public:
     active_goal_monitor_timer_ = this->create_wall_timer(
         std::chrono::milliseconds(200),
         [this]() { onActiveGoalMonitorTimer(); });
+    status_snapshot_timer_ = this->create_wall_timer(
+        std::chrono::seconds(1),
+        [this]() { publishCurrentStatus(); });
 
     RCLCPP_INFO(
         this->get_logger(),
@@ -3209,6 +3212,16 @@ private:
                 reason.c_str());
   }
 
+  void publishCurrentStatus()
+  {
+    if (!state_initialized_) {
+      return;
+    }
+    explore_lite_msgs::msg::ExploreStatus status;
+    status.status = statusForState(state_);
+    status_publisher_->publish(status);
+  }
+
   void publishStatusSnapshot(const std::string& reason)
   {
     if (!state_initialized_) {
@@ -3376,6 +3389,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr resume_subscription_;
   rclcpp::TimerBase::SharedPtr planner_timer_;
   rclcpp::TimerBase::SharedPtr active_goal_monitor_timer_;
+  rclcpp::TimerBase::SharedPtr status_snapshot_timer_;
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;

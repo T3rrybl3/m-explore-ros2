@@ -15,6 +15,7 @@ def generate_launch_description():
     )
     use_sim_time = LaunchConfiguration("use_sim_time")
     namespace = LaunchConfiguration("namespace")
+    start_paused = LaunchConfiguration("start_paused")
 
     declare_use_sim_time_argument = DeclareLaunchArgument(
         "use_sim_time", default_value="true", description="Use simulation/Gazebo clock"
@@ -23,6 +24,11 @@ def generate_launch_description():
         "namespace",
         default_value="",
         description="Namespace for the explore node",
+    )
+    declare_start_paused_argument = DeclareLaunchArgument(
+        "start_paused",
+        default_value="false",
+        description="Start direct exploration paused until /explore/resume is true",
     )
 
     # Map fully qualified names to relative ones so the node's namespace can be prepended.
@@ -35,12 +41,13 @@ def generate_launch_description():
         package="explore_lite",
         name="explore_node",
         namespace=namespace,
-        executable="explore",
-        parameters=[config, {"use_sim_time": use_sim_time}],
+        executable="direct_nav2_explorer",
+        parameters=[config, {"use_sim_time": use_sim_time, "start_paused": start_paused}],
         output="screen",
         remappings=remappings,
     )
     ld.add_action(declare_use_sim_time_argument)
     ld.add_action(declare_namespace_argument)
+    ld.add_action(declare_start_paused_argument)
     ld.add_action(node)
     return ld
